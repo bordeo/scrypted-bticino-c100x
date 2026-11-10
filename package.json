@@ -24,6 +24,12 @@
     "legrand",
     "homekit"
   ],
+  "files": [
+    "dist"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "scrypted": {
     "name": "BTicino C100X",
     "runtime": "python",
