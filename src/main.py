@@ -8,7 +8,7 @@ import json
 import logging
 import os
 import tempfile
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -832,7 +832,7 @@ class C100XPlugin(
         if cert_path.is_file() and key_path.is_file() and ca_path.is_file():
             try:
                 expires = certificate_expiry(cert_path.read_text())
-                needs_cert = expires <= datetime.now(UTC) + timedelta(
+                needs_cert = expires <= datetime.now(timezone.utc) + timedelta(
                     days=CERTIFICATE_RENEWAL_DAYS
                 )
             except Exception:
@@ -844,7 +844,9 @@ class C100XPlugin(
         if needs_cert and stored_cert and stored_key and stored_ca:
             try:
                 expires = certificate_expiry(str(stored_cert))
-                if expires > datetime.now(UTC) + timedelta(days=CERTIFICATE_RENEWAL_DAYS):
+                if expires > datetime.now(timezone.utc) + timedelta(
+                    days=CERTIFICATE_RENEWAL_DAYS
+                ):
                     cert_path.write_text(str(stored_cert))
                     key_path.write_text(str(stored_key))
                     ca_path.write_text(str(stored_ca))

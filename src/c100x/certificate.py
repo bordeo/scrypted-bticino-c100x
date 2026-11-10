@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import base64
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
@@ -86,7 +86,7 @@ async def provision_certificate(
         )
         + "\n-----END CERTIFICATE-----\n"
     )
-    expires_at = certificate.not_valid_after_utc.astimezone(UTC)
+    expires_at = certificate.not_valid_after_utc.astimezone(timezone.utc)
     return CertificateBundle(certificate_pem, private_key_pem, ca_pem, expires_at)
 
 
