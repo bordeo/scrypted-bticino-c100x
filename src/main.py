@@ -595,7 +595,7 @@ class C100XPlugin(
                 await self._connect_stack(str(email), str(password), str(home_id), str(gateway_id))
                 await self.refreshDevices()
         except Exception as err:
-            self.print(f"Bootstrap failed: {type(err).__name__}")
+            self.print(f"Bootstrap failed: {_err_summary(err)}")
 
     async def _ensure_session(self) -> aiohttp.ClientSession:
         if self._session and not self._session.closed:
@@ -725,7 +725,7 @@ class C100XPlugin(
                     str(email), str(password), str(home_id), str(gateway_id)
                 )
             except Exception as err:
-                self.print(f"Connect failed: {type(err).__name__}")
+                self.print(f"Connect failed: {_err_summary(err)}")
 
         await self.refreshDevices()
         await scrypted_sdk.deviceManager.onDeviceEvent(
@@ -995,6 +995,18 @@ class C100XPlugin(
         await scrypted_sdk.deviceManager.onDevicesChanged({"devices": [device]})
         # Ensure instance exists.
         await self.getDevice("doorbell")
+
+
+
+def _err_summary(err: BaseException) -> str:
+    """Type, code-only exception message and frame locations; never args of HTTP/auth errors."""
+    import traceback as _tb
+    frames = _tb.extract_tb(err.__traceback__)[-4:]
+    where = " <- ".join(f"{Path(f.filename).name}:{f.lineno}:{f.name}" for f in reversed(frames))
+    msg = ""
+    if isinstance(err, (AttributeError, TypeError, NameError, KeyError, IndexError)):
+        msg = f" {str(err)[:160]}"
+    return f"{type(err).__name__}{msg} at {where}"
 
 
 def create_scrypted_plugin():
