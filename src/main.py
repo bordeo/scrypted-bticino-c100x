@@ -700,8 +700,22 @@ class C100XPlugin(
         email = _json_get(self.storage, CONF_EMAIL)
         password = _json_get(self.storage, CONF_PASSWORD)
         if key in (CONF_EMAIL, CONF_PASSWORD) and email and password:
-            with contextlib.suppress(Exception):
+            try:
                 await self._load_plants(str(email), str(password))
+            except Exception as err:
+                self._print_picker_failure(err, where="load_plants")
+
+        if key == CONF_HOME_ID:
+            self._gateways_cache = []
+            home_id = _json_get(self.storage, CONF_HOME_ID)
+            if home_id:
+                try:
+                    if self._api is not None:
+                        await self._load_gateways(self._api, str(home_id))
+                    elif email and password:
+                        await self._load_plants(str(email), str(password))
+                except Exception as err:
+                    self._print_picker_failure(err, where="load_gateways")
 
         home_id = _json_get(self.storage, CONF_HOME_ID)
         gateway_id = _json_get(self.storage, CONF_GATEWAY_ID)
@@ -718,12 +732,27 @@ class C100XPlugin(
             None, ScryptedInterface.Settings.value, None
         )
 
+    def _print_picker_failure(self, err: Exception, *, where: str) -> None:
+        # Type and HTTP status only — never tokens, passwords, or email.
+        if isinstance(err, ApiError):
+            self.print(f"{where} failed: {type(err).__name__} HTTP {err.status}")
+        else:
+            self.print(f"{where} failed: {type(err).__name__}")
+
     async def _maybe_refresh_pickers(self) -> None:
         email = _json_get(self.storage, CONF_EMAIL)
         password = _json_get(self.storage, CONF_PASSWORD)
-        if email and password and not self._plants_cache:
-            with contextlib.suppress(Exception):
+        home_id = _json_get(self.storage, CONF_HOME_ID)
+        try:
+            if email and password and not self._plants_cache:
                 await self._load_plants(str(email), str(password))
+            elif home_id and not self._gateways_cache:
+                if self._api is not None:
+                    await self._load_gateways(self._api, str(home_id))
+                elif email and password:
+                    await self._load_plants(str(email), str(password))
+        except Exception as err:
+            self._print_picker_failure(err, where="refresh_pickers")
 
     async def _load_plants(self, email: str, password: str) -> None:
         session = await self._ensure_session()
@@ -754,23 +783,31 @@ class C100XPlugin(
         self._api = api
 
     async def _load_gateways(self, api: LegrandApi, home_id: str) -> None:
-        modules = await api.modules(home_id)
-        gateways = [
-            item
-            for item in modules
-            if str(item.get("device", "")).upper().startswith("C100")
-            or "gateway" in str(item.get("device", "")).casefold()
-            or item.get("id")
-        ]
-        # Prefer modules that look like the VDE gateway; fall back to all modules.
-        vde = [
-            item
-            for item in modules
-            if "c100" in str(item.get("device", "")).casefold()
-            or "vde" in str(item.get("type", "")).casefold()
-            or "gateway" in str(item.get("name", "")).casefold()
-        ]
-        self._gateways_cache = vde or gateways or modules
+        try:
+            modules = await api.modules(home_id)
+        except AuthenticationError as err:
+            log_auth_failure(err, where="load_gateways")
+            raise
+        except ApiError as err:
+            log_api_failure(err, where="load_gateways")
+            raise
+        if not modules:
+            self.print("No modules for this installation; pick another one")
+            self._gateways_cache = []
+            return
+        # HA config_flow selects the module whose device field is exactly "gateway".
+        gateways = [item for item in modules if item.get("device") == "gateway"]
+        if not gateways:
+            # Loose fallback so a differently tagged unit is still offered.
+            gateways = [
+                item
+                for item in modules
+                if "gateway" in str(item.get("device", "")).casefold()
+                or "c100" in str(item.get("device", "")).casefold()
+                or "vde" in str(item.get("type", "")).casefold()
+                or "gateway" in str(item.get("name", "")).casefold()
+            ]
+        self._gateways_cache = gateways or modules
 
     async def _connect_stack(
         self, email: str, password: str, home_id: str, gateway_id: str

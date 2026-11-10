@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.1 — 2026-11-10
+
+- Load the Gateway picker when Installation is saved, not only when email or password changes.
+- Refresh gateways if plants are already cached but the Gateway list is empty.
+- Prefer modules with `device == "gateway"` (same rule as ha-bticino-c100x). Display choices as `Name (id)`.
+- Log picker failures with error type and HTTP status only; print a console message when an installation has no modules.
+
 ## 0.1.0 — 2026-11-10
 
 Initial Scrypted Python plugin for **BTicino Classe 100X** via the Legrand / Door Entry cloud.
