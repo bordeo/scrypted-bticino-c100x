@@ -86,10 +86,87 @@ async def provision_certificate(
         )
         + "\n-----END CERTIFICATE-----\n"
     )
-    expires_at = certificate.not_valid_after_utc.astimezone(timezone.utc)
+    expires_at = certificate_not_valid_after(certificate)
     return CertificateBundle(certificate_pem, private_key_pem, ca_pem, expires_at)
 
 
 def certificate_expiry(certificate_pem: str) -> datetime:
     """Return the timezone-aware certificate expiry."""
-    return x509.load_pem_x509_certificate(certificate_pem.encode()).not_valid_after_utc
+    return certificate_not_valid_after(x509.load_pem_x509_certificate(certificate_pem.encode()))
+
+
+def certificate_not_valid_after(certificate: x509.Certificate) -> datetime:
+    """Return certificate expiry as timezone-aware UTC.
+
+    cryptography 42 added not_valid_after_utc and deprecated not_valid_after.
+    cryptography 46 removed not_valid_after. Some mixed installs expose
+    not_valid_after_utc as a Python wrapper that still reads not_valid_after
+    on a Rust object that no longer has it. Fall back to parsing the TBS.
+    """
+    for name in ("not_valid_after_utc", "not_valid_after"):
+        try:
+            value = getattr(certificate, name)
+        except AttributeError:
+            continue
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+    return _expiry_from_tbs(certificate)
+
+
+def _der_len(data: bytes, index: int) -> tuple[int, int]:
+    first = data[index]
+    if first < 0x80:
+        return first, index + 1
+    count = first & 0x7F
+    start = index + 1
+    return int.from_bytes(data[start : start + count], "big"), start + count
+
+
+def _der_tlv(data: bytes, index: int) -> tuple[int, bytes, int]:
+    tag = data[index]
+    length, start = _der_len(data, index + 1)
+    end = start + length
+    return tag, data[start:end], end
+
+
+def _der_seq_elements(body: bytes) -> list[tuple[int, bytes]]:
+    index = 0
+    elements: list[tuple[int, bytes]] = []
+    while index < len(body):
+        tag, value, index = _der_tlv(body, index)
+        elements.append((tag, value))
+    return elements
+
+
+def _parse_asn1_time(tag: int, value: bytes) -> datetime:
+    text = value.decode("ascii")
+    if tag == 0x17:  # UTCTime YYMMDDHHMMSSZ
+        year = int(text[0:2])
+        year += 1900 if year >= 50 else 2000
+        rest = text[2:]
+    elif tag == 0x18:  # GeneralizedTime YYYYMMDDHHMMSSZ
+        year = int(text[0:4])
+        rest = text[4:]
+    else:
+        raise ValueError(f"unsupported ASN.1 time tag {tag:#x}")
+    return datetime(
+        year,
+        int(rest[0:2]),
+        int(rest[2:4]),
+        int(rest[4:6]),
+        int(rest[6:8]),
+        int(rest[8:10]),
+        tzinfo=timezone.utc,
+    )
+
+
+def _expiry_from_tbs(certificate: x509.Certificate) -> datetime:
+    tag, body, _ = _der_tlv(certificate.tbs_certificate_bytes, 0)
+    if tag != 0x30:
+        raise ValueError("TBS certificate is not a SEQUENCE")
+    elements = _der_seq_elements(body)
+    index = 1 if elements and elements[0][0] == 0xA0 else 0
+    _validity_tag, validity_body = elements[index + 3]
+    times = _der_seq_elements(validity_body)
+    return _parse_asn1_time(*times[1])
