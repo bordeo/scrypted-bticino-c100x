@@ -1,0 +1,17 @@
+.DS_Store
+out/
+node_modules/
+*.map
+src
+.vscode
+tests
+.github
+.venv
+__pycache__/
+.pytest_cache/
+*.py[cod]
+.gitignore
+.gitleaks.toml
+pytest.ini
+requirements.txt
+CHANGELOG.md

@@ -1,0 +1,40 @@
+{
+  "name": "@bordeo/scrypted-bticino-c100x",
+  "version": "0.1.0",
+  "description": "Scrypted plugin for BTicino Classe 100X video door entry via Legrand cloud",
+  "scripts": {
+    "scrypted-setup-project": "scrypted-setup-project",
+    "prescrypted-setup-project": "scrypted-package-json",
+    "build": "scrypted-webpack",
+    "prepublishOnly": "NODE_ENV=production scrypted-webpack",
+    "prescrypted-vscode-launch": "scrypted-webpack",
+    "scrypted-vscode-launch": "scrypted-deploy-debug",
+    "scrypted-deploy-debug": "scrypted-deploy-debug",
+    "scrypted-debug": "scrypted-debug",
+    "scrypted-deploy": "scrypted-deploy",
+    "scrypted-readme": "scrypted-readme",
+    "scrypted-package-json": "scrypted-package-json"
+  },
+  "keywords": [
+    "scrypted",
+    "plugin",
+    "bticino",
+    "c100x",
+    "doorbell",
+    "legrand",
+    "homekit"
+  ],
+  "scrypted": {
+    "name": "BTicino C100X",
+    "runtime": "python",
+    "type": "DeviceProvider",
+    "interfaces": [
+      "ScryptedSystemDevice",
+      "DeviceProvider",
+      "Settings"
+    ]
+  },
+  "devDependencies": {
+    "@scrypted/sdk": "^0.5.59"
+  }
+}
