@@ -224,7 +224,8 @@ async def test_rtsp_buffers_rtp_until_play() -> None:
         await writer.drain()
         try:
             early = await asyncio.wait_for(reader.readexactly(1), timeout=0.15)
-        except TimeoutError:
+        except (TimeoutError, asyncio.TimeoutError):
+            # On 3.10 asyncio.TimeoutError is still distinct from builtin TimeoutError.
             early = b""
         assert early == b""
 
