@@ -1,6 +1,6 @@
 {
   "name": "@bordeo/scrypted-bticino-c100x",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Scrypted plugin for BTicino Classe 100X video door entry via Legrand cloud",
   "scripts": {
     "scrypted-setup-project": "scrypted-setup-project",

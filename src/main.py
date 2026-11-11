@@ -482,12 +482,27 @@ class C100XDoorbell(
             on_keyframe=lambda nal: asyncio.create_task(self._cache_keyframe_jpeg(nal)),
         )
         self._media = media
+        self._logged_first_rtp = False
 
         async def on_connect(session: RtspSession) -> None:
-            # Place the monitoring INVITE as soon as the RTSP TCP client appears
-            # so DESCRIBE/PLAY already have negotiated codecs / media flowing.
+            # Do not block the RTSP handshake on the SIP INVITE. Scrypted's
+            # RtspClient times out OPTIONS after 10s, and a failed INVITE
+            # used to close the TCP socket before OPTIONS was answered.
             device_address = self.plugin.gateway_id or ""
-            await media.start(device_address)
+
+            async def _start_monitoring() -> None:
+                try:
+                    self.print("Starting monitoring call")
+                    await media.start(device_address)
+                    if session.closed:
+                        await media.end()
+                        return
+                    self.print("Monitoring call started")
+                except Exception as err:
+                    self.print(f"Monitoring call failed: {_err_summary(err)}")
+                    await session.close()
+
+            asyncio.create_task(_start_monitoring())
 
         async def on_teardown(session: RtspSession) -> None:
             if self._talkback:
@@ -518,11 +533,11 @@ class C100XDoorbell(
                     "a=rtpmap:96 H264/90000",
                     "a=fmtp:96 packetization-mode=1;profile-level-id=42e01f",
                     "a=control:trackID=0",
-                    "a=recvonly",
+                    "a=sendonly",
                     f"m=audio 0 RTP/AVP {audio_pt}",
                     f"a=rtpmap:{audio_pt} {audio_name}/8000",
                     "a=control:trackID=1",
-                    "a=recvonly",
+                    "a=sendonly",
                     "",
                 ]
             )
@@ -532,12 +547,16 @@ class C100XDoorbell(
             on_teardown=on_teardown,
             sdp_builder=sdp_builder,
             idle_seconds=MEDIA_IDLE_SECONDS,
+            on_log=self.print,
         )
         self._rtsp = server
         url = await server.start()
         return url
 
     async def _on_plain_rtp(self, packet: bytes, kind: str) -> None:
+        if not getattr(self, "_logged_first_rtp", False):
+            self._logged_first_rtp = True
+            self.print(f"First RTP packet: {kind}")
         if self._rtsp:
             await self._rtsp.forward_rtp(packet, kind)
 

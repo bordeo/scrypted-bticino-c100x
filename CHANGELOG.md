@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.5 — 2026-11-11
+
+- Reject non-TCP RTSP SETUP with `461 Unsupported Transport` so Scrypted's client falls back from UDP to TCP interleaved. A 200 reply to UDP SETUP made Play start, then receive no RTP (`stream ended: readLength done`).
+- Advertise `a=sendonly` on the RTSP SDP (the server sends media to the player).
+- Buffer RTP until RTSP PLAY so the first keyframe is not dropped during the handshake.
+- Do not block the RTSP handshake on the SIP monitoring INVITE, and print monitoring/RTSP events to the plugin console.
+
+
+
 ## 0.1.4 — 2026-11-11
 
 - Serialize `getVideoStream`'s MediaStreamUrl as JSON bytes so Scrypted WebRTC can convert it to FFmpegInput. A Python dict was arriving as an RPC object, which made Play fail with `SyntaxError: "[object Object]" is not valid JSON`.
