@@ -11,6 +11,7 @@ import asyncio
 import contextlib
 import logging
 import re
+from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
@@ -18,6 +19,7 @@ _LOGGER = logging.getLogger(__name__)
 
 OnConnect = Callable[["RtspSession"], Awaitable[None]]
 OnTeardown = Callable[["RtspSession"], Awaitable[None]]
+OnLog = Callable[[str], None]
 
 
 @dataclass(slots=True)
@@ -77,11 +79,15 @@ class RtspServer:
         on_teardown: OnTeardown | None = None,
         sdp_builder: Callable[["RtspSession"], str] | None = None,
         idle_seconds: float = 30.0,
+        on_log: OnLog | None = None,
     ) -> None:
         self.on_connect = on_connect
         self.on_teardown = on_teardown
         self.sdp_builder = sdp_builder or _default_sdp
         self.idle_seconds = idle_seconds
+        self.on_log = on_log
+        self._pending: deque[tuple[str, bytes]] = deque()
+        self._pending_limit = 256
         self._server: asyncio.AbstractServer | None = None
         self._session: RtspSession | None = None
         self._lock = asyncio.Lock()
@@ -96,7 +102,23 @@ class RtspServer:
     def session(self) -> RtspSession | None:
         return self._session
 
+    def _log(self, message: str) -> None:
+        _LOGGER.info("%s", message)
+        if self.on_log:
+            with contextlib.suppress(Exception):
+                self.on_log(message)
+
+    async def _flush_pending(self, session: RtspSession) -> None:
+        while self._pending:
+            kind, packet = self._pending.popleft()
+            if session.closed or not session.playing:
+                self._pending.clear()
+                return
+            channel = session.video_channel if kind == "video" else session.audio_channel
+            await session.send_rtp(packet, channel=channel)
+
     async def start(self) -> str:
+
         self._server = await asyncio.start_server(
             self._handle_client, self.host, 0
         )
@@ -118,7 +140,12 @@ class RtspServer:
 
     async def forward_rtp(self, packet: bytes, kind: str) -> None:
         session = self._session
-        if not session or not session.playing:
+        if not session or session.closed:
+            return
+        if not session.playing:
+            self._pending.append((kind, packet))
+            while len(self._pending) > self._pending_limit:
+                self._pending.popleft()
             return
         channel = session.video_channel if kind == "video" else session.audio_channel
         await session.send_rtp(packet, channel=channel)
@@ -140,7 +167,7 @@ class RtspServer:
                     writer.close()
                     with contextlib.suppress(Exception):
                         await writer.wait_closed()
-                _LOGGER.warning("RTSP: rejected second client (one session at a time)")
+                self._log("RTSP: rejected second client (one session at a time)")
                 return
             session = RtspSession(reader=reader, writer=writer, server=self)
             self._session = session
@@ -152,7 +179,7 @@ class RtspServer:
         except asyncio.CancelledError:
             raise
         except Exception as err:
-            _LOGGER.debug("RTSP session ended: %s", type(err).__name__)
+            self._log(f"RTSP session ended: {type(err).__name__}: {err}")
         finally:
             if self.on_teardown:
                 with contextlib.suppress(Exception):
@@ -160,6 +187,7 @@ class RtspServer:
             await session.close()
             if self._session is session:
                 self._session = None
+            self._pending.clear()
 
     async def _serve(self, session: RtspSession) -> None:
         while not session.closed:
@@ -198,6 +226,15 @@ class RtspServer:
                 )
             elif method == "SETUP":
                 transport = headers.get("transport", "")
+                transport_l = transport.lower()
+                # Only TCP interleaved is implemented. Scrypted's RtspClient
+                # tries UDP first and falls back to TCP only on RtspStatusError.
+                # A 200 with a TCP Transport for a UDP SETUP makes it skip the
+                # fallback, so the player never receives RTP.
+                if "interleaved=" not in transport_l and "/tcp" not in transport_l:
+                    self._log("RTSP SETUP rejected: 461 Unsupported Transport")
+                    await _respond(session, 461, "Unsupported Transport")
+                    continue
                 channel = 0
                 match = re.search(r"interleaved=(\d+)(?:-(\d+))?", transport)
                 if match:
@@ -232,6 +269,8 @@ class RtspServer:
                         "RTP-Info": f"url={self.url}trackID=0,seq=0",
                     },
                 )
+                self._log("RTSP PLAY")
+                await self._flush_pending(session)
             elif method == "TEARDOWN":
                 await _respond(session, 200, "OK", extra={"Session": session.session_id})
                 session.playing = False
@@ -252,11 +291,11 @@ def _default_sdp(session: RtspSession) -> str:
             "a=rtpmap:96 H264/90000",
             "a=fmtp:96 packetization-mode=1;profile-level-id=42e01f",
             "a=control:trackID=0",
-            "a=recvonly",
+            "a=sendonly",
             "m=audio 0 RTP/AVP 8",
             "a=rtpmap:8 PCMA/8000",
             "a=control:trackID=1",
-            "a=recvonly",
+            "a=sendonly",
             "",
         ]
     )

@@ -18,15 +18,13 @@ work (upstream GitHub repo no longer available). Maintainer: [@bordeo](https://g
 
 ## Install
 
-```bash
-# From a release zip (recommended)
-npx scrypted install ./scrypted-bticino-c100x-plugin.zip
+In the Scrypted web UI, open **Plugins** and enter the npm package name:
 
-# Or from the built dist after npm run build
-npx scrypted install ./dist/plugin.zip
+```
+@bordeo/scrypted-bticino-c100x
 ```
 
-You can also install from the GitHub release asset attached to each tag.
+Updates are installed from the same Plugins page.
 
 ## Setup
 

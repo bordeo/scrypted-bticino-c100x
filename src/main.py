@@ -46,10 +46,11 @@ from c100x.const import (
 )
 from c100x.models import SipAccount
 from c100x.rtsp_server import RtspServer, RtspSession
-from c100x.sdp import NegotiatedSession
+from c100x.sdp import NegotiatedSession, SdpError
 from c100x.sip import SipClient, SipError
-from c100x.srtp_media import SrtpMediaSession, new_client_id, next_reconnect_delay
+from c100x.srtp_media import MediaSessionError, SrtpMediaSession, new_client_id, next_reconnect_delay
 from c100x.talkback import TalkbackError, TalkbackPipeline
+from c100x.topology import visible_external_units
 
 _LOGGER = logging.getLogger("scrypted-bticino-c100x")
 
@@ -457,8 +458,11 @@ class C100XDoorbell(
             "url": url,
             "mediaStreamOptions": (await self.getVideoStreamOptions())[0],
         }
+        # JSON bytes, not a dict: a Python dict arrives in Node as an RPC
+        # object, and WebRTC's MediaStreamUrl→FFmpegInput converter does
+        # JSON.parse(data.toString()), which becomes "[object Object]".
         return await scrypted_sdk.mediaManager.createMediaObject(
-            media_stream_url,
+            json.dumps(media_stream_url).encode("utf-8"),
             ScryptedMimeTypes.MediaStreamUrl.value,
             {"sourceId": self.id},
         )
@@ -479,12 +483,29 @@ class C100XDoorbell(
             on_keyframe=lambda nal: asyncio.create_task(self._cache_keyframe_jpeg(nal)),
         )
         self._media = media
+        self._logged_first_rtp = False
 
         async def on_connect(session: RtspSession) -> None:
-            # Place the monitoring INVITE as soon as the RTSP TCP client appears
-            # so DESCRIBE/PLAY already have negotiated codecs / media flowing.
-            device_address = self.plugin.gateway_id or ""
-            await media.start(device_address)
+            # Do not block the RTSP handshake on the SIP INVITE. Scrypted's
+            # RtspClient times out OPTIONS after 10s, and a failed INVITE
+            # used to close the TCP socket before OPTIONS was answered.
+            # DEVADDR must be the visible external-unit module id (HA 0.3.3),
+            # not the gateway id — wrong DEVADDR yields SIP 486 Busy Here.
+
+            async def _start_monitoring() -> None:
+                try:
+                    self.print("Starting monitoring call")
+                    device_address = await self.plugin.monitoring_device_address()
+                    await media.start(device_address)
+                    if session.closed:
+                        await media.end()
+                        return
+                    self.print("Monitoring call started")
+                except Exception as err:
+                    self.print(f"Monitoring call failed: {_err_summary(err)}")
+                    await session.close()
+
+            asyncio.create_task(_start_monitoring())
 
         async def on_teardown(session: RtspSession) -> None:
             if self._talkback:
@@ -515,11 +536,11 @@ class C100XDoorbell(
                     "a=rtpmap:96 H264/90000",
                     "a=fmtp:96 packetization-mode=1;profile-level-id=42e01f",
                     "a=control:trackID=0",
-                    "a=recvonly",
+                    "a=sendonly",
                     f"m=audio 0 RTP/AVP {audio_pt}",
                     f"a=rtpmap:{audio_pt} {audio_name}/8000",
                     "a=control:trackID=1",
-                    "a=recvonly",
+                    "a=sendonly",
                     "",
                 ]
             )
@@ -529,12 +550,16 @@ class C100XDoorbell(
             on_teardown=on_teardown,
             sdp_builder=sdp_builder,
             idle_seconds=MEDIA_IDLE_SECONDS,
+            on_log=self.print,
         )
         self._rtsp = server
         url = await server.start()
         return url
 
     async def _on_plain_rtp(self, packet: bytes, kind: str) -> None:
+        if not getattr(self, "_logged_first_rtp", False):
+            self._logged_first_rtp = True
+            self.print(f"First RTP packet: {kind}")
         if self._rtsp:
             await self._rtsp.forward_rtp(packet, kind)
 
@@ -575,6 +600,8 @@ class C100XPlugin(
         self.sip: SipClient | None = None
         self.gateway_id: str | None = None
         self.home_id: str | None = None
+        # Official-topology visible EU module ids (buttonId order), like HA camera_ids.
+        self.camera_ids: list[str] = []
         self._session: aiohttp.ClientSession | None = None
         self._auth: C100XAuth | None = None
         self._api: LegrandApi | None = None
@@ -595,7 +622,7 @@ class C100XPlugin(
                 await self._connect_stack(str(email), str(password), str(home_id), str(gateway_id))
                 await self.refreshDevices()
         except Exception as err:
-            self.print(f"Bootstrap failed: {type(err).__name__}")
+            self.print(f"Bootstrap failed: {_err_summary(err)}")
 
     async def _ensure_session(self) -> aiohttp.ClientSession:
         if self._session and not self._session.closed:
@@ -700,8 +727,22 @@ class C100XPlugin(
         email = _json_get(self.storage, CONF_EMAIL)
         password = _json_get(self.storage, CONF_PASSWORD)
         if key in (CONF_EMAIL, CONF_PASSWORD) and email and password:
-            with contextlib.suppress(Exception):
+            try:
                 await self._load_plants(str(email), str(password))
+            except Exception as err:
+                self._print_picker_failure(err, where="load_plants")
+
+        if key == CONF_HOME_ID:
+            self._gateways_cache = []
+            home_id = _json_get(self.storage, CONF_HOME_ID)
+            if home_id:
+                try:
+                    if self._api is not None:
+                        await self._load_gateways(self._api, str(home_id))
+                    elif email and password:
+                        await self._load_plants(str(email), str(password))
+                except Exception as err:
+                    self._print_picker_failure(err, where="load_gateways")
 
         home_id = _json_get(self.storage, CONF_HOME_ID)
         gateway_id = _json_get(self.storage, CONF_GATEWAY_ID)
@@ -711,19 +752,34 @@ class C100XPlugin(
                     str(email), str(password), str(home_id), str(gateway_id)
                 )
             except Exception as err:
-                self.print(f"Connect failed: {type(err).__name__}")
+                self.print(f"Connect failed: {_err_summary(err)}")
 
         await self.refreshDevices()
         await scrypted_sdk.deviceManager.onDeviceEvent(
             None, ScryptedInterface.Settings.value, None
         )
 
+    def _print_picker_failure(self, err: Exception, *, where: str) -> None:
+        # Type and HTTP status only — never tokens, passwords, or email.
+        if isinstance(err, ApiError):
+            self.print(f"{where} failed: {type(err).__name__} HTTP {err.status}")
+        else:
+            self.print(f"{where} failed: {type(err).__name__}")
+
     async def _maybe_refresh_pickers(self) -> None:
         email = _json_get(self.storage, CONF_EMAIL)
         password = _json_get(self.storage, CONF_PASSWORD)
-        if email and password and not self._plants_cache:
-            with contextlib.suppress(Exception):
+        home_id = _json_get(self.storage, CONF_HOME_ID)
+        try:
+            if email and password and not self._plants_cache:
                 await self._load_plants(str(email), str(password))
+            elif home_id and not self._gateways_cache:
+                if self._api is not None:
+                    await self._load_gateways(self._api, str(home_id))
+                elif email and password:
+                    await self._load_plants(str(email), str(password))
+        except Exception as err:
+            self._print_picker_failure(err, where="refresh_pickers")
 
     async def _load_plants(self, email: str, password: str) -> None:
         session = await self._ensure_session()
@@ -754,23 +810,57 @@ class C100XPlugin(
         self._api = api
 
     async def _load_gateways(self, api: LegrandApi, home_id: str) -> None:
-        modules = await api.modules(home_id)
-        gateways = [
-            item
-            for item in modules
-            if str(item.get("device", "")).upper().startswith("C100")
-            or "gateway" in str(item.get("device", "")).casefold()
-            or item.get("id")
+        try:
+            modules = await api.modules(home_id)
+        except AuthenticationError as err:
+            log_auth_failure(err, where="load_gateways")
+            raise
+        except ApiError as err:
+            log_api_failure(err, where="load_gateways")
+            raise
+        if not modules:
+            self.print("No modules for this installation; pick another one")
+            self._gateways_cache = []
+            return
+        # HA config_flow selects the module whose device field is exactly "gateway".
+        gateways = [item for item in modules if item.get("device") == "gateway"]
+        if not gateways:
+            # Loose fallback so a differently tagged unit is still offered.
+            gateways = [
+                item
+                for item in modules
+                if "gateway" in str(item.get("device", "")).casefold()
+                or "c100" in str(item.get("device", "")).casefold()
+                or "vde" in str(item.get("type", "")).casefold()
+                or "gateway" in str(item.get("name", "")).casefold()
+            ]
+        self._gateways_cache = gateways or modules
+
+    async def _refresh_camera_ids(self) -> None:
+        """Load visible external-unit ids from official topology (HA camera_ids)."""
+        if not self._api or not self.home_id:
+            self.camera_ids = []
+            return
+        modules = await self._api.modules(self.home_id)
+        self.camera_ids = [
+            str(module["id"]) for module in visible_external_units(modules)
         ]
-        # Prefer modules that look like the VDE gateway; fall back to all modules.
-        vde = [
-            item
-            for item in modules
-            if "c100" in str(item.get("device", "")).casefold()
-            or "vde" in str(item.get("type", "")).casefold()
-            or "gateway" in str(item.get("name", "")).casefold()
-        ]
-        self._gateways_cache = vde or gateways or modules
+
+    async def monitoring_device_address(self) -> str:
+        """Return the EU module id for SDP ``a=DEVADDR:`` on a monitoring INVITE.
+
+        Matches ha-bticino-c100x 0.3.3: MediaSession.start(camera_id) where
+        camera_ids come from ``visible_external_units`` (buttonId order).
+        This plugin supports one unit — the first visible EU. Never use the
+        gateway id here; that yields SIP 486 Busy Here on live door units.
+        """
+        if not self.camera_ids:
+            await self._refresh_camera_ids()
+        if not self.camera_ids:
+            raise RuntimeError(
+                "No official-app-visible external unit was found in the topology"
+            )
+        return self.camera_ids[0]
 
     async def _connect_stack(
         self, email: str, password: str, home_id: str, gateway_id: str
@@ -793,6 +883,7 @@ class C100XPlugin(
         self.home_id = home_id
         self.gateway_id = gateway_id
         await self._load_gateways(api, home_id)
+        await self._refresh_camera_ids()
 
         account = await self._prepare_account_and_certificate(api, auth, home_id, gateway_id)
         material = self._files_dir()
@@ -958,6 +1049,30 @@ class C100XPlugin(
         await scrypted_sdk.deviceManager.onDevicesChanged({"devices": [device]})
         # Ensure instance exists.
         await self.getDevice("doorbell")
+
+
+
+def _err_summary(err: BaseException) -> str:
+    """Type, safe protocol message and frame locations; never args of HTTP/auth errors."""
+    import traceback as _tb
+    frames = _tb.extract_tb(err.__traceback__)[-4:]
+    where = " <- ".join(f"{Path(f.filename).name}:{f.lineno}:{f.name}" for f in reversed(frames))
+    msg = ""
+    if isinstance(
+        err,
+        (
+            AttributeError,
+            TypeError,
+            NameError,
+            KeyError,
+            IndexError,
+            SipError,
+            MediaSessionError,
+            SdpError,
+        ),
+    ):
+        msg = f" {str(err)[:160]}"
+    return f"{type(err).__name__}{msg} at {where}"
 
 
 def create_scrypted_plugin():
