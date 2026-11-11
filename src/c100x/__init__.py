@@ -15,4 +15,5 @@ __all__ = [
     "srtp_media",
     "rtsp_server",
     "talkback",
+    "topology",
 ]

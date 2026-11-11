@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.7 — 2026-11-11
+
+- Advertise the official-topology visible external unit (`deviceType`/`device` `eu`) module id as SDP `a=DEVADDR:` on monitoring INVITEs, matching ha-bticino-c100x 0.3.3 (`visible_external_units` / `buttonId` order). Passing the gateway id instead caused SIP `486 Busy Here` and a black player with no First RTP on live door units.
+- Fail clearly when no official-app-visible external unit is present in the plant topology.
+
 ## 0.1.6 — 2026-11-11
 
 - Include `SipError`, `MediaSessionError`, and `SdpError` messages in console summaries so a failed monitoring INVITE prints its SIP status (for example `486` or `488`) instead of only the exception type and stack frames.

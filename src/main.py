@@ -50,6 +50,7 @@ from c100x.sdp import NegotiatedSession, SdpError
 from c100x.sip import SipClient, SipError
 from c100x.srtp_media import MediaSessionError, SrtpMediaSession, new_client_id, next_reconnect_delay
 from c100x.talkback import TalkbackError, TalkbackPipeline
+from c100x.topology import visible_external_units
 
 _LOGGER = logging.getLogger("scrypted-bticino-c100x")
 
@@ -488,11 +489,13 @@ class C100XDoorbell(
             # Do not block the RTSP handshake on the SIP INVITE. Scrypted's
             # RtspClient times out OPTIONS after 10s, and a failed INVITE
             # used to close the TCP socket before OPTIONS was answered.
-            device_address = self.plugin.gateway_id or ""
+            # DEVADDR must be the visible external-unit module id (HA 0.3.3),
+            # not the gateway id — wrong DEVADDR yields SIP 486 Busy Here.
 
             async def _start_monitoring() -> None:
                 try:
                     self.print("Starting monitoring call")
+                    device_address = await self.plugin.monitoring_device_address()
                     await media.start(device_address)
                     if session.closed:
                         await media.end()
@@ -597,6 +600,8 @@ class C100XPlugin(
         self.sip: SipClient | None = None
         self.gateway_id: str | None = None
         self.home_id: str | None = None
+        # Official-topology visible EU module ids (buttonId order), like HA camera_ids.
+        self.camera_ids: list[str] = []
         self._session: aiohttp.ClientSession | None = None
         self._auth: C100XAuth | None = None
         self._api: LegrandApi | None = None
@@ -831,6 +836,32 @@ class C100XPlugin(
             ]
         self._gateways_cache = gateways or modules
 
+    async def _refresh_camera_ids(self) -> None:
+        """Load visible external-unit ids from official topology (HA camera_ids)."""
+        if not self._api or not self.home_id:
+            self.camera_ids = []
+            return
+        modules = await self._api.modules(self.home_id)
+        self.camera_ids = [
+            str(module["id"]) for module in visible_external_units(modules)
+        ]
+
+    async def monitoring_device_address(self) -> str:
+        """Return the EU module id for SDP ``a=DEVADDR:`` on a monitoring INVITE.
+
+        Matches ha-bticino-c100x 0.3.3: MediaSession.start(camera_id) where
+        camera_ids come from ``visible_external_units`` (buttonId order).
+        This plugin supports one unit — the first visible EU. Never use the
+        gateway id here; that yields SIP 486 Busy Here on live door units.
+        """
+        if not self.camera_ids:
+            await self._refresh_camera_ids()
+        if not self.camera_ids:
+            raise RuntimeError(
+                "No official-app-visible external unit was found in the topology"
+            )
+        return self.camera_ids[0]
+
     async def _connect_stack(
         self, email: str, password: str, home_id: str, gateway_id: str
     ) -> None:
@@ -852,6 +883,7 @@ class C100XPlugin(
         self.home_id = home_id
         self.gateway_id = gateway_id
         await self._load_gateways(api, home_id)
+        await self._refresh_camera_ids()
 
         account = await self._prepare_account_and_certificate(api, auth, home_id, gateway_id)
         material = self._files_dir()
