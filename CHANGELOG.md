@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.6 — 2026-11-11
+
+- Include `SipError`, `MediaSessionError`, and `SdpError` messages in console summaries so a failed monitoring INVITE prints its SIP status (for example `486` or `488`) instead of only the exception type and stack frames.
+
 ## 0.1.5 — 2026-11-11
 
 - Reject non-TCP RTSP SETUP with `461 Unsupported Transport` so Scrypted's client falls back from UDP to TCP interleaved. A 200 reply to UDP SETUP made Play start, then receive no RTP (`stream ended: readLength done`).

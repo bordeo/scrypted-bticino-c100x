@@ -46,9 +46,9 @@ from c100x.const import (
 )
 from c100x.models import SipAccount
 from c100x.rtsp_server import RtspServer, RtspSession
-from c100x.sdp import NegotiatedSession
+from c100x.sdp import NegotiatedSession, SdpError
 from c100x.sip import SipClient, SipError
-from c100x.srtp_media import SrtpMediaSession, new_client_id, next_reconnect_delay
+from c100x.srtp_media import MediaSessionError, SrtpMediaSession, new_client_id, next_reconnect_delay
 from c100x.talkback import TalkbackError, TalkbackPipeline
 
 _LOGGER = logging.getLogger("scrypted-bticino-c100x")
@@ -1021,12 +1021,24 @@ class C100XPlugin(
 
 
 def _err_summary(err: BaseException) -> str:
-    """Type, code-only exception message and frame locations; never args of HTTP/auth errors."""
+    """Type, safe protocol message and frame locations; never args of HTTP/auth errors."""
     import traceback as _tb
     frames = _tb.extract_tb(err.__traceback__)[-4:]
     where = " <- ".join(f"{Path(f.filename).name}:{f.lineno}:{f.name}" for f in reversed(frames))
     msg = ""
-    if isinstance(err, (AttributeError, TypeError, NameError, KeyError, IndexError)):
+    if isinstance(
+        err,
+        (
+            AttributeError,
+            TypeError,
+            NameError,
+            KeyError,
+            IndexError,
+            SipError,
+            MediaSessionError,
+            SdpError,
+        ),
+    ):
         msg = f" {str(err)[:160]}"
     return f"{type(err).__name__}{msg} at {where}"
 
