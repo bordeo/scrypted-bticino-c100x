@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.4 — 2026-11-11
+
+- Serialize `getVideoStream`'s MediaStreamUrl as JSON bytes so Scrypted WebRTC can convert it to FFmpegInput. A Python dict was arriving as an RPC object, which made Play fail with `SyntaxError: "[object Object]" is not valid JSON`.
+
+
 ## 0.1.1 — 2026-11-10
 
 - Load the Gateway picker when Installation is saved, not only when email or password changes.

@@ -457,8 +457,11 @@ class C100XDoorbell(
             "url": url,
             "mediaStreamOptions": (await self.getVideoStreamOptions())[0],
         }
+        # JSON bytes, not a dict: a Python dict arrives in Node as an RPC
+        # object, and WebRTC's MediaStreamUrl→FFmpegInput converter does
+        # JSON.parse(data.toString()), which becomes "[object Object]".
         return await scrypted_sdk.mediaManager.createMediaObject(
-            media_stream_url,
+            json.dumps(media_stream_url).encode("utf-8"),
             ScryptedMimeTypes.MediaStreamUrl.value,
             {"sourceId": self.id},
         )
