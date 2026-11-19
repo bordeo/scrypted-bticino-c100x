@@ -472,18 +472,12 @@ class C100XDoorbell(
             with contextlib.suppress(Exception):
                 await self._rtsp.stop()
             self._rtsp = None
-        if self._media:
-            with contextlib.suppress(Exception):
-                await self._media.end()
-            self._media = None
+        await self._end_media()
 
-        media = SrtpMediaSession(
-            self.plugin.sip,
-            on_plain_rtp=self._on_plain_rtp,
-            on_keyframe=lambda nal: asyncio.create_task(self._cache_keyframe_jpeg(nal)),
-        )
-        self._media = media
-        self._logged_first_rtp = False
+        # One SrtpMediaSession per RTSP client, bound to the SipClient that is
+        # current *at connect time*. The server can outlive a SIP reconnect
+        # (settings save, supervisor), so it must never capture a SipClient.
+        session_media: dict[int, SrtpMediaSession] = {}
 
         async def on_connect(session: RtspSession) -> None:
             # Do not block the RTSP handshake on the SIP INVITE. Scrypted's
@@ -491,6 +485,21 @@ class C100XDoorbell(
             # used to close the TCP socket before OPTIONS was answered.
             # DEVADDR must be the visible external-unit module id (HA 0.3.3),
             # not the gateway id — wrong DEVADDR yields SIP 486 Busy Here.
+
+            sip = self.plugin.sip
+            if sip is None or not sip.registered:
+                self.print("Monitoring call failed: SIP is not registered yet")
+                await session.close()
+                return
+            await self._end_media()
+            media = SrtpMediaSession(
+                sip,
+                on_plain_rtp=self._on_plain_rtp,
+                on_keyframe=lambda nal: asyncio.create_task(self._cache_keyframe_jpeg(nal)),
+            )
+            self._media = media
+            session_media[id(session)] = media
+            self._logged_first_rtp = False
 
             async def _start_monitoring() -> None:
                 try:
@@ -508,16 +517,18 @@ class C100XDoorbell(
             asyncio.create_task(_start_monitoring())
 
         async def on_teardown(session: RtspSession) -> None:
-            if self._talkback:
-                with contextlib.suppress(Exception):
-                    await self._talkback.stop()
+            media = session_media.pop(id(session), None)
+            if media is None:
+                return
             if self._media is media:
+                await self._end_media()
+            else:
                 with contextlib.suppress(Exception):
                     await media.end()
-                self._media = None
 
         def sdp_builder(session: RtspSession) -> str:
-            negotiated: NegotiatedSession | None = media.negotiated
+            media = session_media.get(id(session))
+            negotiated: NegotiatedSession | None = media.negotiated if media else None
             audio_pt = 8
             audio_name = "PCMA"
             if negotiated and negotiated.audio:
@@ -555,6 +566,29 @@ class C100XDoorbell(
         self._rtsp = server
         url = await server.start()
         return url
+
+    async def _end_media(self) -> None:
+        """Stop talkback and end the current monitoring call, if any."""
+        talkback, self._talkback = self._talkback, None
+        if talkback:
+            with contextlib.suppress(Exception):
+                await talkback.stop()
+        media, self._media = self._media, None
+        if media:
+            with contextlib.suppress(Exception):
+                await media.end()
+
+    async def reset_media(self) -> None:
+        """Drop every media object tied to the current SipClient.
+
+        Called before the provider closes SIP. Stopping the RTSP server closes
+        any connected client so the next view asks for a fresh stream URL.
+        """
+        rtsp, self._rtsp = self._rtsp, None
+        if rtsp:
+            with contextlib.suppress(Exception):
+                await rtsp.stop()
+        await self._end_media()
 
     async def _on_plain_rtp(self, packet: bytes, kind: str) -> None:
         if not getattr(self, "_logged_first_rtp", False):
@@ -720,7 +754,13 @@ class C100XPlugin(
             value = value.rsplit("(", 1)[-1].rstrip(")").strip()
 
         if key == CONF_ENABLE_TALKBACK:
-            value = value in (True, "true", "True", 1, "1")
+            # Only toggles the Intercom interface; never tear down SIP for it.
+            _json_set(self.storage, key, value in (True, "true", "True", 1, "1"))
+            await self.refreshDevices()
+            await scrypted_sdk.deviceManager.onDeviceEvent(
+                None, ScryptedInterface.Settings.value, None
+            )
+            return
 
         _json_set(self.storage, key, value)
 
@@ -1013,10 +1053,8 @@ class C100XPlugin(
             self._supervise_task.cancel()
             await asyncio.gather(self._supervise_task, return_exceptions=True)
             self._supervise_task = None
-        if self.device and self.device._media:
-            with contextlib.suppress(Exception):
-                await self.device._media.end()
-            self.device._media = None
+        if self.device:
+            await self.device.reset_media()
         if self.sip:
             with contextlib.suppress(Exception):
                 await self.sip.close()

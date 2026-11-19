@@ -13,6 +13,7 @@ from sdk_stub import install as install_sdk
 @pytest.mark.asyncio
 async def test_get_video_stream_serializes_media_stream_url_as_json() -> None:
     sdk, types_mod = install_sdk()
+    sdk.mediaManager.createMediaObject.reset_mock()
     import main as plugin_main
 
     plugin = plugin_main.C100XPlugin.__new__(plugin_main.C100XPlugin)

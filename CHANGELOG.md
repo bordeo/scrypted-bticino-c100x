@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.8 — unreleased
+
+- Fix Casa/HomeKit video stopping after a provider settings save (for example ticking "Enable talkback"): the save reconnected SIP, but the reused RTSP server kept a media session bound to the closed SipClient, so every view failed with `SIP connection is not open`. Media sessions are now created per RTSP client from the SipClient current at connect time, and the RTSP server, talkback and media are dropped whenever SIP is torn down (settings save or supervisor reconnect).
+- Toggling "Enable talkback" on the provider no longer tears down and re-registers SIP; it only refreshes the doorbell's Intercom interface.
+
 ## 0.1.7 — 2026-11-11
 
 - Advertise the official-topology visible external unit (`deviceType`/`device` `eu`) module id as SDP `a=DEVADDR:` on monitoring INVITEs, matching ha-bticino-c100x 0.3.3 (`visible_external_units` / `buttonId` order). Passing the gateway id instead caused SIP `486 Busy Here` and a black player with no First RTP on live door units.
