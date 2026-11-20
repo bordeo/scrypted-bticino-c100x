@@ -5,11 +5,12 @@ from __future__ import annotations
 import asyncio
 import shutil
 import time
+from types import SimpleNamespace
 
 import pytest
 
 from c100x.g711 import encode_g711
-from c100x.srtp_media import serialize_rtp
+from c100x.srtp_media import SrtpMediaSession, serialize_rtp
 from c100x.talkback import TalkbackError, TalkbackPipeline
 
 
@@ -48,6 +49,33 @@ class FakeMedia:
 
     def send_talkback_pcm(self, pcm: bytes) -> None:
         self.audio.send_pcm(pcm)
+
+
+class GapFillAudio:
+    """Minimal audio stub for keepalive gap-fill handoff tests."""
+
+    def __init__(self) -> None:
+        self.silence_force: list[bool] = []
+        self._last_tx_mono = 0.0
+        self.tx_packets = 0
+
+    @property
+    def last_tx_mono(self) -> float:
+        return self._last_tx_mono
+
+    def tx_gap_seconds(self, now: float | None = None) -> float:
+        if self._last_tx_mono <= 0.0:
+            return 999.0
+        return (time.monotonic() if now is None else now) - self._last_tx_mono
+
+    def note_mic_tx(self) -> None:
+        self._last_tx_mono = time.monotonic()
+        self.tx_packets += 1
+
+    async def send_silence(self, *, force: bool = False) -> None:
+        self.silence_force.append(force)
+        self._last_tx_mono = time.monotonic()
+        self.tx_packets += 1
 
 
 @pytest.mark.asyncio
@@ -94,6 +122,52 @@ async def test_talkback_pipeline_ffmpeg_sine_produces_20ms_frames() -> None:
         payload=encoded,
     )
     assert packet[1] & 0x7F == 8
+
+
+@pytest.mark.asyncio
+async def test_uplink_handoff_gap_fills_silence_until_mic_flows() -> None:
+    """Talkback armed without mic frames must keep ~50 pps via forced silence.
+
+    Regression for field 0.1.16: set_talkback(True) stopped silence before the
+    HomeKit return-audio ffmpeg produced PCM, freezing tx_pkts for seconds.
+    """
+    session = SrtpMediaSession.__new__(SrtpMediaSession)
+    session._ending = False
+    session.talkback_enabled = True
+    audio = GapFillAudio()
+    session.audio = audio  # type: ignore[assignment]
+    session.negotiated = SimpleNamespace(
+        audio=SimpleNamespace(direction="sendrecv"),
+    )
+
+    task = asyncio.create_task(session._audio_keepalive())
+    try:
+        # Phase 1: talkback on, no mic — forced silence gap-fill.
+        await asyncio.sleep(0.12)
+        forced = [f for f in audio.silence_force if f]
+        assert len(forced) >= 3, f"expected gap-fill silence, got {audio.silence_force!r}"
+        before_mic = audio.tx_packets
+
+        # Phase 2: mic frames arrive every 20 ms — silence should pause.
+        audio.silence_force.clear()
+        for _ in range(6):
+            audio.note_mic_tx()
+            await asyncio.sleep(0.02)
+        # At most one race tick may sneak in; must not keep 50 pps silence.
+        assert len(audio.silence_force) <= 2, (
+            f"mic flowing but silence still fired: {audio.silence_force!r}"
+        )
+        assert audio.tx_packets > before_mic
+
+        # Phase 3: mic stalls — silence resumes (force=True).
+        audio.silence_force.clear()
+        await asyncio.sleep(0.12)
+        assert any(audio.silence_force), "silence must resume when mic stalls"
+        assert all(audio.silence_force), "gap-fill during talkback must force=True"
+    finally:
+        session._ending = True
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 @pytest.mark.asyncio

@@ -212,10 +212,23 @@ class _MediaRtpProtocol(asyncio.DatagramProtocol):
         self._ssrc = secrets.randbelow(2**32)
         self._first_packet = True
         self._got_media = False
+        # Monotonic time of last uplink TX (silence or mic). Used to gap-fill
+        # silence during talkback so the door never sees a TX stall.
+        self._last_tx_mono = 0.0
         self.rx_packets = 0
         self.rx_bytes = 0
         self.tx_packets = 0
         self.tx_bytes = 0
+
+    @property
+    def last_tx_mono(self) -> float:
+        return self._last_tx_mono
+
+    def tx_gap_seconds(self, now: float | None = None) -> float:
+        """Seconds since the last uplink packet (silence or mic)."""
+        if self._last_tx_mono <= 0.0:
+            return 999.0
+        return (time.monotonic() if now is None else now) - self._last_tx_mono
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
         self.transport = transport  # type: ignore[assignment]
@@ -328,8 +341,16 @@ class _MediaRtpProtocol(asyncio.DatagramProtocol):
             if chain is not None:
                 chain.cancel()
 
-    async def send_silence(self) -> None:
-        if self._talkback or self._codec is None:
+    async def send_silence(self, *, force: bool = False) -> None:
+        """Send one silence frame.
+
+        When ``force`` is False (legacy), silence is suppressed while talkback
+        is enabled. Prefer the session keepalive's gap-fill path (``force=True``)
+        so uplink never stalls waiting for mic frames.
+        """
+        if self._codec is None:
+            return
+        if self._talkback and not force:
             return
         name = self._codec.name.casefold()
         try:
@@ -345,7 +366,7 @@ class _MediaRtpProtocol(asyncio.DatagramProtocol):
                 payload = speex_silence_frame(self._codec.clock_rate or 8000)
                 if payload is None and self._speex is not None:
                     payload = await self._speex.encode_silence()
-                if payload and not self._talkback:
+                if payload and (force or not self._talkback):
                     self._send_payload(payload, samples=samples)
         except (ValueError, pylibsrtp.Error, OSError):
             return
@@ -357,6 +378,10 @@ class _MediaRtpProtocol(asyncio.DatagramProtocol):
         self._pcm.extend(pcm)
         name = self._codec.name.casefold()
         frame_bytes = self._fmt.frame_bytes
+        # Bound latency: keep at most ~100 ms of PCM if Speex encode is slow.
+        max_buffered = frame_bytes * 5
+        if len(self._pcm) > max_buffered:
+            del self._pcm[:-max_buffered]
         while len(self._pcm) >= frame_bytes:
             chunk = bytes(self._pcm[:frame_bytes])
             del self._pcm[:frame_bytes]
@@ -427,6 +452,7 @@ class _MediaRtpProtocol(asyncio.DatagramProtocol):
         self.transport.sendto(protected, self._remote)
         self.tx_packets += 1
         self.tx_bytes += len(protected)
+        self._last_tx_mono = time.monotonic()
         self._first_packet = False
         self._sequence = (self._sequence + 1) & 0xFFFF
         self._timestamp = (self._timestamp + samples) & 0xFFFFFFFF
@@ -774,17 +800,29 @@ class SrtpMediaSession:
             raise
 
     async def _audio_keepalive(self) -> None:
+        """Maintain ~50 pps uplink: silence, or gap-fill when mic frames lag.
+
+        Field regression (0.1.14–0.1.16): ``set_talkback(True)`` stopped silence
+        before the HomeKit return-audio ffmpeg pipeline produced PCM, so TX
+        stalled (~5 s at fixed tx_pkts) and the door never heard the phone.
+        Always gap-fill when no uplink packet was sent within ~18 ms.
+        """
+        # Just under one 20 ms ptime so a late mic frame still wins the slot.
+        gap_fill_after = 0.018
         try:
             while not self._ending:
                 session = self.negotiated
                 if (
-                    not self.talkback_enabled
-                    and self.audio
+                    self.audio
                     and session
                     and session.audio
                     and session.audio.direction in {"sendrecv", "recvonly"}
                 ):
-                    await self.audio.send_silence()
+                    if not self.talkback_enabled:
+                        await self.audio.send_silence()
+                    elif self.audio.tx_gap_seconds() >= gap_fill_after:
+                        # Talkback armed but no mic frame this ptime — keep TX alive.
+                        await self.audio.send_silence(force=True)
                 await asyncio.sleep(0.02)
         except asyncio.CancelledError:
             raise

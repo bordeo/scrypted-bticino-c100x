@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.17 — unreleased
+
+- Talkback uplink handoff: never stop silence keepalive when Intercom arms. Gap-fill canned Speex/Opus/G.711 silence whenever no mic frame is sent within ~18 ms, so TX stays at ~50 pps while HomeKit return-audio ffmpeg connects or stalls (field: tx_pkts froze after `startIntercom` on 0.1.15/0.1.16).
+- Talkback pipeline: drain ffmpeg stderr (avoid pipe-full deadlock), timed stdout reads, low-delay/probesize flags; bound Speex PCM backlog.
+- Version bump past published npm 0.1.16 (PR’s 0.1.16 never shipped from this tree).
+
 ## 0.1.16 — unreleased
 
 - Snapshots: portrait + landscape day/night assets (`placeholder_{day,night}.jpg` and `placeholder_{day,night}_wide.jpg`). Pick the closest aspect to the HAP request, then cover-crop (never stretch) to the exact size (long side ≤1280). No size → wide 16:9 asset. `getPictureOptions` advertises 1280×720 so HomeKit’s Cameras tile does not stretch a portrait.
