@@ -243,12 +243,14 @@ class _MediaRtpProtocol(asyncio.DatagramProtocol):
 
         Speex mic frames only update ``_last_tx_mono`` after async encode, so a
         naive 18 ms TX-gap check would inject canned silence into healthy
-        talkback. Treat recent PCM accept / in-flight Speex encode as "frame
-        ready" and only gap-fill when those are also stale (or encode exceeds
-        ``encode_budget``).
+        talkback. Hold off briefly while PCM was just queued or Speex encode is
+        in flight — but cap that hold by **TX stall** (``encode_budget``), not
+        mic-accept age. Otherwise continuous HomeKit PCM would refresh
+        ``_mic_queued_mono`` forever and a stuck Speex chain would freeze TX.
         """
         now = time.monotonic() if now is None else now
-        if self.tx_gap_seconds(now) < gap_fill_after:
+        tx_gap = self.tx_gap_seconds(now)
+        if tx_gap < gap_fill_after:
             return False
         if not self._talkback:
             return True
@@ -256,10 +258,10 @@ class _MediaRtpProtocol(asyncio.DatagramProtocol):
             now - self._mic_queued_mono if self._mic_queued_mono > 0.0 else 999.0
         )
         inflight = self._speex_chain is not None and not self._speex_chain.done()
-        if inflight and mic_age < encode_budget:
+        # Healthy Speex path: TX may lag encode by tens of ms — don't inject yet.
+        if tx_gap < encode_budget and (inflight or mic_age < gap_fill_after):
             return False
-        if mic_age < gap_fill_after:
-            return False
+        # TX stalled beyond encode budget (or no mic activity) → force silence.
         return True
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import shutil
 import time
 from types import SimpleNamespace
@@ -80,7 +81,8 @@ class GapFillAudio:
     ) -> bool:
         # Mirror _MediaRtpProtocol.needs_uplink_gap_fill for the keepalive test.
         now = time.monotonic() if now is None else now
-        if self.tx_gap_seconds(now) < gap_fill_after:
+        tx_gap = self.tx_gap_seconds(now)
+        if tx_gap < gap_fill_after:
             return False
         if not self._talkback:
             return True
@@ -88,9 +90,7 @@ class GapFillAudio:
             now - self._mic_queued_mono if self._mic_queued_mono > 0.0 else 999.0
         )
         inflight = self._speex_chain is not None and not self._speex_chain.done()
-        if inflight and mic_age < encode_budget:
-            return False
-        if mic_age < gap_fill_after:
+        if tx_gap < encode_budget and (inflight or mic_age < gap_fill_after):
             return False
         return True
 
@@ -189,18 +189,17 @@ async def test_uplink_handoff_gap_fills_silence_until_mic_flows() -> None:
         )
         assert audio.tx_packets > before_mic
 
-        # Phase 3: Speex-like encode in flight (TX stale, mic just queued) —
-        # must NOT inject silence into healthy talkback.
+        # Phase 3: Speex-like encode in flight with short TX lag — no inject.
         audio.silence_force.clear()
 
         async def _slow_encode() -> None:
-            await asyncio.sleep(0.08)
+            await asyncio.sleep(0.05)
 
         audio._speex_chain = asyncio.create_task(_slow_encode())
         audio.note_mic_queued()
-        # Age the last TX so a naive gap check would fire.
-        audio._last_tx_mono = time.monotonic() - 0.05
-        await asyncio.sleep(0.06)
+        # Age TX enough for naive 18 ms check, but under encode_budget (100 ms).
+        audio._last_tx_mono = time.monotonic() - 0.03
+        await asyncio.sleep(0.04)
         assert not audio.silence_force, (
             f"in-flight Speex encode must not get silence injected: {audio.silence_force!r}"
         )
@@ -208,7 +207,28 @@ async def test_uplink_handoff_gap_fills_silence_until_mic_flows() -> None:
         audio._speex_chain = None
         audio.note_mic_tx()
 
-        # Phase 4: mic stalls — silence resumes (force=True).
+        # Phase 4: stuck Speex (TX > encode_budget) while PCM keeps arriving —
+        # must force silence so tx_pkts cannot freeze again.
+        audio.silence_force.clear()
+
+        async def _stuck_encode() -> None:
+            await asyncio.sleep(0.3)
+
+        audio._speex_chain = asyncio.create_task(_stuck_encode())
+        audio._last_tx_mono = time.monotonic() - 0.15
+        for _ in range(4):
+            audio.note_mic_queued()  # refreshing mic_age must not block fill
+            await asyncio.sleep(0.02)
+        assert any(audio.silence_force), (
+            f"stuck Speex with fresh PCM must still gap-fill: {audio.silence_force!r}"
+        )
+        audio._speex_chain.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await audio._speex_chain
+        audio._speex_chain = None
+        audio.note_mic_tx()
+
+        # Phase 5: mic stalls — silence resumes (force=True).
         audio.silence_force.clear()
         await asyncio.sleep(0.12)
         assert any(audio.silence_force), "silence must resume when mic stalls"
@@ -220,7 +240,7 @@ async def test_uplink_handoff_gap_fills_silence_until_mic_flows() -> None:
 
 
 def test_needs_uplink_gap_fill_speex_inflight() -> None:
-    """Unit: TX gap alone must not gap-fill while Speex encode is in flight."""
+    """Unit: short TX lag with Speex in flight must not gap-fill; long stall must."""
     from c100x.srtp_media import _MediaRtpProtocol
 
     class _Inflight:
@@ -233,10 +253,15 @@ def test_needs_uplink_gap_fill_speex_inflight() -> None:
 
     proto = _MediaRtpProtocol("audio", lambda *_: None)
     proto._talkback = True
+    # Healthy Speex: TX lag 50 ms, encode still running, mic just queued.
     proto._last_tx_mono = time.monotonic() - 0.05
     proto._mic_queued_mono = time.monotonic()
     proto._speex_chain = _Inflight()  # type: ignore[assignment]
     assert proto.needs_uplink_gap_fill() is False
+    # Stuck Speex: PCM keeps refreshing mic_age, but TX stalled > encode_budget.
+    proto._last_tx_mono = time.monotonic() - 0.15
+    proto._mic_queued_mono = time.monotonic()  # fresh accept must NOT block fill
+    assert proto.needs_uplink_gap_fill() is True
     proto._speex_chain = _Done()  # type: ignore[assignment]
     proto._mic_queued_mono = time.monotonic() - 0.05
     assert proto.needs_uplink_gap_fill() is True
