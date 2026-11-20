@@ -7,7 +7,7 @@
 - Media path: Opus downlink is RTP passthrough to RTSP (`opus/48000/2`); talkback/silence uplink encoded with `opuslib`. Speex downlink passthrough; uplink via ffmpeg `libspeex` when available (clear log otherwise). G.711 unchanged.
 - Root cause for field 0.1.9 talk failure: PCMA/PCMU-only offer was rejected (`m=audio 0`); Opus-first offer should negotiate usable audio. No extra SIP step for talk (local unmute), same as the official app.
 - Bugbot: abort `start()` before INVITE when `_discarded` after STUN/sockets; failed-start BYEs only the dialog that start created (including ACK-after-200 failures) so a replacement HomeKit call is not hung up.
-- Speex uplink uses Scrypted `getFFmpegPath()` (not PATH-only), serializes encodes, caches silence for keepalive near ptime.
+- Speex uplink uses Scrypted `getFFmpegPath()` (not PATH-only), serializes encodes with epoch stop, caches silence for keepalive near ptime, and closes ffmpeg on warm-up failure.
 
 ## 0.1.10 — unreleased
 

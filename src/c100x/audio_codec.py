@@ -147,16 +147,20 @@ class SpeexFfmpegEncoder:
             "rtp",
             f"rtp://127.0.0.1:{self._local_port}?pkt_size=1200",
         ]
-        self._process = await asyncio.create_subprocess_exec(
-            *command,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        # Prime and cache one silence frame for keepalive (may take >ptime once).
-        silence = await self._encode_unlocked(
-            b"\x00" * (self.frame_samples * 2), timeout=1.0
-        )
+        try:
+            self._process = await asyncio.create_subprocess_exec(
+                *command,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            # Prime and cache one silence frame for keepalive (may take >ptime once).
+            silence = await self._encode_unlocked(
+                b"\x00" * (self.frame_samples * 2), timeout=1.0
+            )
+        except Exception:
+            await self.close()
+            raise
         if silence:
             self._silence_payload = silence
         else:

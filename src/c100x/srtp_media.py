@@ -201,6 +201,7 @@ class _MediaRtpProtocol(asyncio.DatagramProtocol):
         self._speex: SpeexFfmpegEncoder | None = None
         self._speex_pending = False
         self._speex_chain: asyncio.Task[None] | None = None
+        self._speex_epoch = 0
         self._remote: tuple[str, int] | None = None
         self._talkback = False
         self._pcm = bytearray()
@@ -273,9 +274,14 @@ class _MediaRtpProtocol(asyncio.DatagramProtocol):
             sample_rate=self._codec.clock_rate or 8000,
             payload_type=self._codec.payload_type,
         )
+        # Assign before await so protocol close()/teardown during warm-up sees it.
+        self._speex = encoder
         try:
             await encoder.start()
         except Exception as err:  # noqa: BLE001
+            self._speex = None
+            with contextlib.suppress(Exception):
+                await encoder.close()
             _LOGGER.error(
                 "Speex negotiated but ffmpeg libspeex encoder failed (%s); "
                 "talkback/silence uplink disabled",
@@ -283,7 +289,6 @@ class _MediaRtpProtocol(asyncio.DatagramProtocol):
             )
             self._speex_pending = False
             return
-        self._speex = encoder
         self._speex_pending = False
 
     def prime_remote(self) -> None:
@@ -310,6 +315,7 @@ class _MediaRtpProtocol(asyncio.DatagramProtocol):
         self._talkback = enabled
         if not enabled:
             self._pcm.clear()
+            self._speex_epoch += 1
             chain, self._speex_chain = self._speex_chain, None
             if chain is not None:
                 chain.cancel()
@@ -327,7 +333,7 @@ class _MediaRtpProtocol(asyncio.DatagramProtocol):
             elif name == "speex" and self._speex is not None:
                 # Cached after warm-up so keepalive stays near ptime.
                 payload = await self._speex.encode_silence()
-                if payload:
+                if payload and not self._talkback:
                     self._send_payload(
                         payload, samples=self._fmt.frame_samples if self._fmt else 160
                     )
@@ -356,20 +362,39 @@ class _MediaRtpProtocol(asyncio.DatagramProtocol):
                 self._send_payload(payload, samples=self._opus.frame_samples)
             elif name == "speex":
                 prev = self._speex_chain
+                epoch = self._speex_epoch
 
-                async def _run(frame: bytes = chunk, prior: asyncio.Task[None] | None = prev) -> None:
+                async def _run(
+                    frame: bytes = chunk,
+                    prior: asyncio.Task[None] | None = prev,
+                    expected: int = epoch,
+                ) -> None:
                     if prior is not None:
-                        with contextlib.suppress(asyncio.CancelledError, Exception):
+                        # Do not swallow CancelledError from *this* task; only
+                        # ignore a cancelled/failed predecessor so the chain
+                        # can stop when talkback is disabled.
+                        with contextlib.suppress(Exception):
                             await prior
-                    await self._send_speex_pcm(frame)
+                    if not self._talkback or self._speex_epoch != expected:
+                        return
+                    await self._send_speex_pcm(frame, expected)
 
                 self._speex_chain = asyncio.create_task(_run())
 
-    async def _send_speex_pcm(self, chunk: bytes) -> None:
-        if self._speex is None or self._fmt is None:
+    async def _send_speex_pcm(self, chunk: bytes, epoch: int) -> None:
+        if (
+            not self._talkback
+            or self._speex_epoch != epoch
+            or self._speex is None
+            or self._fmt is None
+        ):
             return
         payload = await self._speex.encode(chunk)
-        if payload:
+        if (
+            payload
+            and self._talkback
+            and self._speex_epoch == epoch
+        ):
             self._send_payload(payload, samples=self._fmt.frame_samples)
 
     def _send_payload(self, payload: bytes, *, samples: int) -> None:
@@ -589,8 +614,9 @@ class SrtpMediaSession:
                 answer = await self.sip.start_monitoring(offer.sdp)
             except Exception:
                 # Dialog may already be installed if ACK failed after the 200.
-                if self.sip.on_call_end == self.remote_ended:
-                    owned_dialog = self.sip._dialog
+                # Capture even when end() already released on_call_end — BYE of
+                # that explicit dialog will not clear a replacement session.
+                owned_dialog = self.sip._dialog
                 raise
             owned_dialog = self.sip._dialog
             # ``_ending`` clears when teardown finishes, so also require live
