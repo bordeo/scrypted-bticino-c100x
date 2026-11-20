@@ -197,7 +197,7 @@ async def test_rtsp_udp_setup_accepted() -> None:
 @pytest.mark.asyncio
 async def test_rtsp_playing_idle_refreshed_by_rtp() -> None:
     """RTP activity must keep the session alive past a short idle window."""
-    server = RtspServer(idle_seconds=0.4)
+    server = RtspServer(idle_seconds=0.5)
     url = await server.start()
     reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
     try:
@@ -213,22 +213,30 @@ async def test_rtsp_playing_idle_refreshed_by_rtp() -> None:
         await _rtsp_exchange(
             reader, writer, [f"PLAY {url} RTSP/1.0", "CSeq: 2", "Session: 1"]
         )
+        assert server.session is not None and server.session.playing
+
         packet = serialize_rtp(
             payload_type=96, sequence=1, timestamp=0, ssrc=1, payload=b"\x65"
         )
-        for _ in range(8):
+        # Keep RTP flowing longer than idle_seconds; activity should refresh.
+        for _ in range(6):
             await server.forward_rtp(packet, "video")
-            await asyncio.sleep(0.15)
-            # Drain interleaved frames so the reader buffer doesn't fill.
-            with contextlib.suppress(TimeoutError, asyncio.TimeoutError):
-                while True:
-                    dollar = await asyncio.wait_for(reader.readexactly(1), timeout=0.05)
-                    if dollar != b"$":
-                        break
-                    ch_len = await reader.readexactly(3)
-                    length = int.from_bytes(ch_len[1:3], "big")
-                    await reader.readexactly(length)
-        # Session still accepts GET_PARAMETER after > idle_seconds of wall time.
+            await asyncio.sleep(0.2)
+            assert server.session is not None and not server.session.closed
+
+        # Drain any interleaved RTP then send a keepalive.
+        await asyncio.sleep(0.05)
+        with contextlib.suppress(
+            TimeoutError, asyncio.TimeoutError, asyncio.exceptions.IncompleteReadError
+        ):
+            while True:
+                dollar = await asyncio.wait_for(reader.readexactly(1), timeout=0.05)
+                if dollar != b"$":
+                    break
+                ch_len = await reader.readexactly(3)
+                length = int.from_bytes(ch_len[1:3], "big")
+                await reader.readexactly(length)
+
         resp = await _rtsp_exchange(
             reader,
             writer,

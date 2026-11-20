@@ -241,11 +241,13 @@ class RtspServer:
             timeout = self.idle_seconds if session.playing else 60.0
             if session.playing:
                 # Activity-based idle: RTP forward refreshes last_activity.
+                # Do not floor the wait at 1s — short idle windows (and the
+                # remaining slice after a recent RTP touch) must be honoured.
                 remaining = self.idle_seconds - (time.monotonic() - session.last_activity)
                 if remaining <= 0:
                     _LOGGER.info("RTSP idle timeout; tearing down")
                     raise TimeoutError("RTSP idle timeout")
-                timeout = max(1.0, min(timeout, remaining))
+                timeout = max(0.05, min(timeout, remaining))
             try:
                 request = await asyncio.wait_for(
                     _read_rtsp_request(session.reader),
