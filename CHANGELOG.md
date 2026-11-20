@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.11 — unreleased
+
+- Monitoring INVITE audio offer matches the official Door Entry / linphone-sdk shape: `RTP/SAVP 96 97 98 8 0 101 100` with Opus (`96 opus/48000/2`, `useinbandfec=1`), Speex 16/8 kHz, PCMA/PCMU, telephone-event, `a=ptime:20`, `a=sendrecv`, plus session `a=DEVADDR:` and SDES `a=crypto` (video remains H.264 `recvonly`).
+- `parse_answer` accepts Opus/Speex/G.711 and logs one redacted line with audio port, chosen codec/PT, and direction.
+- Media path: Opus downlink is RTP passthrough to RTSP (`opus/48000/2`); talkback/silence uplink encoded with `opuslib`. Speex downlink passthrough; uplink via ffmpeg `libspeex` when available (clear log otherwise). G.711 unchanged.
+- Root cause for field 0.1.9 talk failure: PCMA/PCMU-only offer was rejected (`m=audio 0`); Opus-first offer should negotiate usable audio. No extra SIP step for talk (local unmute), same as the official app.
+
 ## 0.1.10 — unreleased
 
 - Talkback / door audio diagnosis and hardening for HomeKit remote views:

@@ -10,6 +10,10 @@ from dataclasses import dataclass, field
 SRTP_SUITE = "AES_CM_128_HMAC_SHA1_80"
 SRTP_KEY_BYTES = 30
 
+# Offer order matches the official Door Entry / linphone-sdk shape.
+OFFER_AUDIO_PAYLOADS = (96, 97, 98, 8, 0, 101, 100)
+SUPPORTED_AUDIO_NAMES = frozenset({"opus", "speex", "pcma", "pcmu"})
+
 _CRYPTO_INLINE_RE = re.compile(
     r"(a=crypto:\d+\s+\S+\s+inline:)[A-Za-z0-9+/=|_-]+",
     re.IGNORECASE,
@@ -88,6 +92,16 @@ def new_crypto() -> CryptoAttribute:
     return CryptoAttribute(1, SRTP_SUITE, secrets.token_bytes(SRTP_KEY_BYTES))
 
 
+def select_audio_codec(media: MediaDescription | None) -> Codec | None:
+    """Pick the first supported audio codec from the answer (payload order)."""
+    if media is None:
+        return None
+    for codec in media.codecs:
+        if codec.name.casefold() in SUPPORTED_AUDIO_NAMES:
+            return codec
+    return None
+
+
 def build_monitoring_offer(
     *,
     address: str,
@@ -99,7 +113,12 @@ def build_monitoring_offer(
     advertised_video_port: int | None = None,
     advertised_video_rtcp_port: int | None = None,
 ) -> MonitoringOffer:
-    """Build the verified Classe 100X monitoring shape with mandatory SRTP."""
+    """Build the Door Entry / linphone-shaped monitoring offer with mandatory SRTP.
+
+    Audio offers Opus first (then Speex, G.711), matching static analysis of the
+    official app (linphone-sdk). Payload types are scoped per m-line, so audio
+    PT 96 (Opus) does not conflict with video PT 96 (H.264).
+    """
     audio_crypto = new_crypto()
     video_crypto = new_crypto()
     public_audio = advertised_audio_port or audio_port
@@ -107,6 +126,7 @@ def build_monitoring_offer(
     public_video = advertised_video_port or video_port
     public_video_rtcp = advertised_video_rtcp_port or public_video + 1
     session_id = secrets.randbits(63)
+    audio_payloads = " ".join(str(pt) for pt in OFFER_AUDIO_PAYLOADS)
     lines = [
         "v=0",
         f"o=- {session_id} {session_id} IN IP4 {address}",
@@ -114,10 +134,17 @@ def build_monitoring_offer(
         f"c=IN IP4 {address}",
         "t=0 0",
         f"a=DEVADDR:{device_address}",
-        f"m=audio {public_audio} RTP/SAVP 8 0",
+        f"m=audio {public_audio} RTP/SAVP {audio_payloads}",
         f"a=rtcp:{public_audio_rtcp} IN IP4 {address}",
+        "a=rtpmap:96 opus/48000/2",
+        "a=fmtp:96 useinbandfec=1",
+        "a=rtpmap:97 speex/16000",
+        "a=rtpmap:98 speex/8000",
         "a=rtpmap:8 PCMA/8000",
         "a=rtpmap:0 PCMU/8000",
+        "a=rtpmap:101 telephone-event/48000",
+        "a=rtpmap:100 telephone-event/8000",
+        "a=ptime:20",
         "a=sendrecv",
         f"a=crypto:1 {SRTP_SUITE} inline:{audio_crypto.inline}",
         f"m=video {public_video} RTP/SAVP 96",
@@ -245,7 +272,7 @@ def parse_answer(value: bytes | str, offer: MonitoringOffer) -> NegotiatedSessio
         raise SdpError("The external unit did not negotiate H.264 video")
     if video.direction not in {"sendonly", "sendrecv"}:
         raise SdpError("The external unit did not enable video transmission")
-    if audio is not None and audio.codec({"pcma", "pcmu"}) is None:
+    if audio is not None and select_audio_codec(audio) is None:
         raise SdpError("The external unit selected an unsupported audio codec")
     return NegotiatedSession(offer=offer, audio=audio, video=video)
 
@@ -267,9 +294,14 @@ def build_receive_sdp(session: NegotiatedSession, *, include_audio: bool = True)
             continue
         if media.kind == "audio" and not include_audio:
             continue
-        payloads = " ".join(str(codec.payload_type) for codec in media.codecs)
+        chosen = select_audio_codec(media) if media.kind == "audio" else None
+        if media.kind == "audio" and chosen is not None:
+            codecs = [chosen]
+        else:
+            codecs = list(media.codecs)
+        payloads = " ".join(str(codec.payload_type) for codec in codecs)
         lines.append(f"m={media.kind} {local_port} RTP/SAVP {payloads}")
-        for codec in media.codecs:
+        for codec in codecs:
             channels = f"/{codec.channels}" if codec.channels != 1 else ""
             lines.append(
                 f"a=rtpmap:{codec.payload_type} {codec.name}/{codec.clock_rate}{channels}"
@@ -332,13 +364,15 @@ def explain_answer_audio(value: bytes | str) -> str:
 
 
 def format_negotiated_audio(session: NegotiatedSession) -> str:
-    """Human-readable negotiated audio summary for logs / talkback errors."""
+    """One-line audio summary: port, chosen codec/PT, direction (never keys)."""
     audio = session.audio
     if audio is None:
         return "none"
-    codec = audio.codec({"pcma", "pcmu"})
-    codec_name = codec.name.upper() if codec else "unsupported"
+    codec = select_audio_codec(audio)
+    if codec is None:
+        return f"port={audio.port} direction={audio.direction} codec=unsupported"
+    channels = f"/{codec.channels}" if codec.channels != 1 else ""
     return (
         f"port={audio.port} direction={audio.direction} "
-        f"codec={codec_name} proto={audio.protocol}"
+        f"codec={codec.name}/{codec.clock_rate}{channels} pt={codec.payload_type}"
     )

@@ -1,8 +1,8 @@
-"""Talkback uplink: FFmpegInput → s16le mono 8 kHz → G.711 → SRTP.
+"""Talkback uplink: FFmpegInput → s16le PCM → negotiated codec → SRTP.
 
 HomeKit return audio arrives as an FFmpegInput MediaObject. We spawn ffmpeg to
-pipe PCM, encode with the negotiated G.711 codec in 20 ms / 160-byte frames,
-SRTP-protect with our key, and send from the call's audio socket.
+pipe PCM at the rate required by the negotiated codec (48 kHz Opus, 8/16 kHz
+Speex, 8 kHz G.711), encode in 20 ms frames, SRTP-protect, and send.
 """
 
 from __future__ import annotations
@@ -16,7 +16,6 @@ from typing import Any
 from .srtp_media import SrtpMediaSession
 
 _LOGGER = logging.getLogger(__name__)
-FRAME_BYTES = 320  # 20 ms mono s16le @ 8 kHz
 
 
 class TalkbackError(RuntimeError):
@@ -31,6 +30,7 @@ class TalkbackPipeline:
         self._process: asyncio.subprocess.Process | None = None
         self._task: asyncio.Task[None] | None = None
         self._active = False
+        self._frame_bytes = 320
 
     @property
     def active(self) -> bool:
@@ -40,10 +40,13 @@ class TalkbackPipeline:
         """Start talkback from a Scrypted FFmpegInput JSON object."""
         if not self.media.active:
             raise TalkbackError("No active call for talkback")
+        fmt = self.media.talkback_format()
+        if fmt is None:
+            raise TalkbackError("No negotiated audio codec for talkback")
         await self.stop()
+        self._frame_bytes = fmt.frame_bytes
         url = ffmpeg_input.get("url") or ""
         input_args = list(ffmpeg_input.get("inputArguments") or [])
-        # Prefer explicit inputArguments; fall back to -i url.
         command = [ffmpeg_path, "-hide_banner", "-loglevel", "error", "-nostdin"]
         if input_args:
             command.extend(str(arg) for arg in input_args)
@@ -57,9 +60,9 @@ class TalkbackPipeline:
                 "-sn",
                 "-dn",
                 "-ac",
-                "1",
+                str(fmt.channels),
                 "-ar",
-                "8000",
+                str(fmt.sample_rate),
                 "-f",
                 "s16le",
                 "pipe:1",
@@ -102,13 +105,13 @@ class TalkbackPipeline:
         buf = bytearray()
         try:
             while self._active:
-                chunk = await self._process.stdout.read(FRAME_BYTES)
+                chunk = await self._process.stdout.read(self._frame_bytes)
                 if not chunk:
                     break
                 buf.extend(chunk)
-                while len(buf) >= FRAME_BYTES:
-                    frame = bytes(buf[:FRAME_BYTES])
-                    del buf[:FRAME_BYTES]
+                while len(buf) >= self._frame_bytes:
+                    frame = bytes(buf[: self._frame_bytes])
+                    del buf[: self._frame_bytes]
                     self.media.send_talkback_pcm(frame)
         except asyncio.CancelledError:
             raise

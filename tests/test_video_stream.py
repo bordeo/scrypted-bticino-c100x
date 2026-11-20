@@ -33,7 +33,8 @@ async def test_get_video_stream_serializes_media_stream_url_as_json() -> None:
     assert payload["url"] == "rtsp://127.0.0.1:12345/c100x"
     assert payload["mediaStreamOptions"]["id"] == "default"
     assert payload["mediaStreamOptions"]["video"]["codec"] == "h264"
-    assert payload["mediaStreamOptions"]["audio"]["codec"] == "pcm_alaw"
+    assert payload["mediaStreamOptions"]["audio"]["codec"] == "opus"
+    assert payload["mediaStreamOptions"]["audio"]["sampleRate"] == 48000
     assert options["sourceId"] == device.id
     assert result == data
 

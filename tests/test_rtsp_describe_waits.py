@@ -43,12 +43,16 @@ async def test_options_not_blocked_by_slow_previous_bye(monkeypatch) -> None:
 
         async def start(self, device_address):
             await bye_released.wait()
+            opus = SimpleNamespace(
+                payload_type=96, name="opus", clock_rate=48000, channels=2, fmtp=None
+            )
             self.negotiated = SimpleNamespace(
                 audio=SimpleNamespace(
                     port=6000,
                     direction="sendrecv",
                     protocol="RTP/SAVP",
-                    codec=lambda _names: SimpleNamespace(payload_type=8, name="PCMA"),
+                    codecs=[opus],
+                    codec=lambda _names: opus,
                 )
             )
             return self.negotiated

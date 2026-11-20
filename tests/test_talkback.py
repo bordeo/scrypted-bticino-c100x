@@ -37,6 +37,11 @@ class FakeMedia:
     def active(self) -> bool:
         return self._active
 
+    def talkback_format(self):
+        from c100x.audio_codec import TalkbackFormat
+
+        return TalkbackFormat(8000)
+
     async def set_talkback(self, enabled: bool) -> None:
         self.talkback_enabled = enabled
         self.audio.set_talkback(enabled)

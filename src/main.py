@@ -48,7 +48,7 @@ from c100x.const import (
 )
 from c100x.models import SipAccount
 from c100x.rtsp_server import RtspServer, RtspSession
-from c100x.sdp import NegotiatedSession, SdpError, format_negotiated_audio
+from c100x.sdp import NegotiatedSession, SdpError, format_negotiated_audio, select_audio_codec
 from c100x.sip import SipClient, SipError
 from c100x.srtp_media import MediaSessionError, SrtpMediaSession, new_client_id, next_reconnect_delay
 from c100x.talkback import TalkbackError, TalkbackPipeline
@@ -438,12 +438,26 @@ class C100XDoorbell(
     # --- Video stream -----------------------------------------------------
 
     async def getVideoStreamOptions(self) -> list[ResponseMediaStreamOptions]:
+        # Prefer Opus (official Door Entry offer); Scrypted/HomeKit remux as needed.
+        audio: dict[str, Any] = {"codec": "opus", "sampleRate": 48000}
+        if self._media and self._media.active:
+            codec = self._media.selected_audio_codec()
+            if codec is not None:
+                name = codec.name.casefold()
+                if name == "opus":
+                    audio = {"codec": "opus", "sampleRate": codec.clock_rate}
+                elif name == "speex":
+                    audio = {"codec": "speex", "sampleRate": codec.clock_rate}
+                elif name == "pcmu":
+                    audio = {"codec": "pcm_mulaw", "sampleRate": 8000}
+                else:
+                    audio = {"codec": "pcm_alaw", "sampleRate": 8000}
         return [
             {
                 "id": "default",
                 "name": "Door Entry",
                 "video": {"codec": "h264"},
-                "audio": {"codec": "pcm_alaw", "sampleRate": 8000},
+                "audio": audio,
             }
         ]
 
@@ -579,7 +593,7 @@ class C100XDoorbell(
             if ready is None:
                 return
             # Best-effort wait for INVITE so DESCRIBE can use the negotiated
-            # codec. Audio is always advertised (default PCMA) even on timeout
+            # codec. Audio is always advertised (default Opus) even on timeout
             # so a slow BYE/486 window cannot leave HomeKit without an audio track.
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(ready.wait(), timeout=12.0)
@@ -601,35 +615,39 @@ class C100XDoorbell(
             negotiated: NegotiatedSession | None = (
                 media.negotiated if media is not None else None
             )
-            audio_pt = 8
-            audio_name = "PCMA"
+            # Default to Opus (official offer preference) before negotiation.
+            audio_pt = 96
+            audio_rtpmap = "opus/48000/2"
+            audio_fmtp = "a=fmtp:96 useinbandfec=1"
             if negotiated and negotiated.audio:
-                codec = negotiated.audio.codec({"pcma", "pcmu"})
-                if codec:
+                codec = select_audio_codec(negotiated.audio)
+                if codec is not None:
                     audio_pt = codec.payload_type
-                    audio_name = codec.name.upper()
-            # Always advertise audio (HA exposes playback only after monitoring,
-            # but Scrypted's DESCRIBE can race INVITE). Prefer negotiated codec
-            # when ready; otherwise default PCMA so HomeKit still SETs UP talkback.
-            return "\r\n".join(
-                [
-                    "v=0",
-                    "o=- 0 0 IN IP4 127.0.0.1",
-                    "s=BTicino C100X",
-                    "c=IN IP4 127.0.0.1",
-                    "t=0 0",
-                    "m=video 0 RTP/AVP 96",
-                    "a=rtpmap:96 H264/90000",
-                    "a=fmtp:96 packetization-mode=1;profile-level-id=42e01f",
-                    "a=control:trackID=0",
-                    "a=sendonly",
-                    f"m=audio 0 RTP/AVP {audio_pt}",
-                    f"a=rtpmap:{audio_pt} {audio_name}/8000",
-                    "a=control:trackID=1",
-                    "a=sendonly",
-                    "",
-                ]
-            )
+                    channels = f"/{codec.channels}" if codec.channels != 1 else ""
+                    audio_rtpmap = f"{codec.name}/{codec.clock_rate}{channels}"
+                    audio_fmtp = (
+                        f"a=fmtp:{codec.payload_type} {codec.fmtp}"
+                        if codec.fmtp
+                        else ""
+                    )
+            lines = [
+                "v=0",
+                "o=- 0 0 IN IP4 127.0.0.1",
+                "s=BTicino C100X",
+                "c=IN IP4 127.0.0.1",
+                "t=0 0",
+                "m=video 0 RTP/AVP 96",
+                "a=rtpmap:96 H264/90000",
+                "a=fmtp:96 packetization-mode=1;profile-level-id=42e01f",
+                "a=control:trackID=0",
+                "a=sendonly",
+                f"m=audio 0 RTP/AVP {audio_pt}",
+                f"a=rtpmap:{audio_pt} {audio_rtpmap}",
+            ]
+            if audio_fmtp:
+                lines.append(audio_fmtp)
+            lines.extend(["a=control:trackID=1", "a=sendonly", ""])
+            return "\r\n".join(lines)
 
         server = RtspServer(
             on_connect=on_connect,

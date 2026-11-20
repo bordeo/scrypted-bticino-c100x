@@ -50,13 +50,17 @@ def _make(plugin_main, failures, *, status=486):
             if self.attempts <= failures:
                 raise SipError(f"Monitoring call failed with SIP status {status}")
             self.started = True
-            # Minimal negotiated session (audio present so DESCRIBE can advertise it).
+            # Minimal negotiated session (Opus; DESCRIBE / format_negotiated_audio).
+            opus = SimpleNamespace(
+                payload_type=96, name="opus", clock_rate=48000, channels=2, fmtp=None
+            )
             self.negotiated = SimpleNamespace(
                 audio=SimpleNamespace(
                     port=6000,
                     direction="sendrecv",
                     protocol="RTP/SAVP",
-                    codec=lambda _names: SimpleNamespace(payload_type=8, name="PCMA"),
+                    codecs=[opus],
+                    codec=lambda _names: opus,
                 )
             )
             return self.negotiated
