@@ -2,3 +2,4 @@ aiohttp>=3.9.0
 cryptography>=42.0.0
 pylibsrtp>=0.10.0
 opuslib>=3.0.1
+Pillow>=10.0.0

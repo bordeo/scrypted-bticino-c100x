@@ -34,7 +34,6 @@ from scrypted_sdk.types import (
 )
 
 from c100x.api import ApiError, LegrandApi, log_api_failure
-from c100x.assets import load_citofono_placeholder
 from c100x.auth import AuthenticationError, C100XAuth, log_auth_failure
 from c100x.certificate import certificate_expiry, provision_certificate
 from c100x.const import (
@@ -45,6 +44,8 @@ from c100x.const import (
     CONF_EXPOSE_DOOR_OPENER,
     CONF_GATEWAY_ID,
     CONF_HOME_ID,
+    CONF_LATITUDE,
+    CONF_LONGITUDE,
     CONF_PASSWORD,
     DEFAULT_DOOR_AUDIO_GAIN_DB,
     DOOR_AUDIO_GAIN_MAX_DB,
@@ -63,7 +64,19 @@ from c100x.models import SipAccount
 from c100x.rtsp_server import RtspServer, RtspSession
 from c100x.sdp import NegotiatedSession, SdpError, format_negotiated_audio, select_audio_codec
 from c100x.sip import SipClient, SipError
+from c100x.snapshot import (
+    choose_placeholder_jpeg,
+    parse_picture_size,
+    resize_jpeg_cover,
+)
 from c100x.srtp_media import MediaSessionError, SrtpMediaSession, new_client_id, next_reconnect_delay
+from c100x.sun import (
+    DEFAULT_LATITUDE,
+    DEFAULT_LONGITUDE,
+    DEFAULT_TIMEZONE,
+    clamp_latitude,
+    clamp_longitude,
+)
 from c100x.talkback import TalkbackError, TalkbackPipeline
 from c100x.topology import visible_external_units, visible_lock_modules
 
@@ -82,9 +95,6 @@ _SECRET_KEYS = frozenset(
         "client_id",
     }
 )
-
-PLACEHOLDER_JPEG = load_citofono_placeholder()
-
 
 def _json_get(storage, key: str, default=None):
     try:
@@ -277,22 +287,41 @@ class C100XDoorbell(
     # --- Camera / snapshots -----------------------------------------------
 
     async def getPictureOptions(self):
-        # Advertise a snapshot so Casa/HomeKit can fill the tile without a SIP call.
+        # Native asset is 576×1024 portrait; HomeKit may request other sizes (canResize).
         return [
             {
                 "id": "default",
                 "name": "Citofono",
-                "picture": {"width": 1280, "height": 720},
+                "picture": {"width": 576, "height": 1024},
+                "canResize": True,
             }
         ]
 
-    async def takePicture(self, options=None) -> MediaObject:
-        """Return a recent keyframe JPEG, else the bundled Citofono placeholder.
+    def _snapshot_coords(self) -> tuple[float, float]:
+        lat = _json_get(self.plugin.storage, CONF_LATITUDE, DEFAULT_LATITUDE)
+        lon = _json_get(self.plugin.storage, CONF_LONGITUDE, DEFAULT_LONGITUDE)
+        try:
+            return clamp_latitude(float(lat)), clamp_longitude(float(lon))
+        except (TypeError, ValueError):
+            return DEFAULT_LATITUDE, DEFAULT_LONGITUDE
 
-        Never places a monitoring SIP call for snapshots.
+    async def takePicture(self, options=None) -> MediaObject:
+        """Return a recent keyframe JPEG, else day/night placeholder.
+
+        Never places a monitoring SIP call for snapshots. When HomeKit passes
+        a requested size, center-crop (cover) and resize (long side ≤ 1280).
         """
         self._warn_prebuffer()
-        jpeg = self._last_jpeg or PLACEHOLDER_JPEG
+        if self._last_jpeg:
+            jpeg = self._last_jpeg
+        else:
+            lat, lon = self._snapshot_coords()
+            jpeg = choose_placeholder_jpeg(
+                latitude=lat, longitude=lon, tz_name=DEFAULT_TIMEZONE
+            )
+        size = parse_picture_size(options)
+        if size is not None:
+            jpeg = resize_jpeg_cover(jpeg, size[0], size[1])
         return await scrypted_sdk.mediaManager.createMediaObject(jpeg, "image/jpeg")
 
     async def _cache_keyframe_jpeg(self, nal_payload: bytes) -> None:
@@ -941,6 +970,24 @@ class C100XPlugin(
                     "(unlock = apriporta). Off removes the Lock(s) from Scrypted/HomeKit."
                 ),
             },
+            {
+                "key": CONF_LATITUDE,
+                "title": "Snapshot latitude",
+                "value": _json_get(self.storage, CONF_LATITUDE, DEFAULT_LATITUDE),
+                "description": (
+                    f"Used for day/night placeholder (local sunrise/sunset, no network). "
+                    f"Default {DEFAULT_LATITUDE} (Peraga, Vigonza)."
+                ),
+            },
+            {
+                "key": CONF_LONGITUDE,
+                "title": "Snapshot longitude",
+                "value": _json_get(self.storage, CONF_LONGITUDE, DEFAULT_LONGITUDE),
+                "description": (
+                    f"Used with latitude for day/night placeholder. "
+                    f"Default {DEFAULT_LONGITUDE} (Peraga, Vigonza, Europe/Rome)."
+                ),
+            },
         ]
 
     async def putSetting(self, key: str, value: Any) -> None:
@@ -973,6 +1020,26 @@ class C100XPlugin(
 
         if key == CONF_DOOR_AUDIO_GAIN_DB:
             _json_set(self.storage, key, clamp_door_audio_gain_db(value))
+            await scrypted_sdk.deviceManager.onDeviceEvent(
+                None, ScryptedInterface.Settings.value, None
+            )
+            return
+
+        if key == CONF_LATITUDE:
+            try:
+                _json_set(self.storage, key, clamp_latitude(float(value)))
+            except (TypeError, ValueError):
+                _json_set(self.storage, key, DEFAULT_LATITUDE)
+            await scrypted_sdk.deviceManager.onDeviceEvent(
+                None, ScryptedInterface.Settings.value, None
+            )
+            return
+
+        if key == CONF_LONGITUDE:
+            try:
+                _json_set(self.storage, key, clamp_longitude(float(value)))
+            except (TypeError, ValueError):
+                _json_set(self.storage, key, DEFAULT_LONGITUDE)
             await scrypted_sdk.deviceManager.onDeviceEvent(
                 None, ScryptedInterface.Settings.value, None
             )

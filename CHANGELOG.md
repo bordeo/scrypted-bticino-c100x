@@ -4,6 +4,7 @@
 
 - Door audio gain: plugin setting **Door audio gain (dB)** (default +12, range 0–24). Downlink Speex/Opus/G.711 is still SRTP→RTP into local RTSP; HomeKit’s remux has no plugin `volume=` hook, so when gain > 0 the plugin transcodes in-path (ffmpeg decode → `volume=NdB,alimiter` → Opus) and advertises Opus on the RTSP audio track. Gain 0 keeps RTP passthrough.
 - HomeKit door opener: opt-in provider setting **Expose door opener to HomeKit** (default on) publishes each official-topology visible Lock as a Scrypted `Lock` device. `lock()` is a no-op (stays Locked); `unlock()` sends the same SIP `MESSAGE` / `lock.setStatus` apriporta as ha-bticino-c100x, logs a UTC timestamp, then auto-returns to Locked after 3 s.
+- Snapshots: day/night placeholders (`placeholder_day.jpg` / `placeholder_night.jpg`, 576×1024) chosen by local sunrise/sunset for Peraga/Vigonza (45.42, 11.96, Europe/Rome; optional lat/lon settings). `takePicture` honors HAP requested size with center-crop cover + resize (long side ≤ 1280, JPEG q≈80); without a size returns the portrait asset as-is.
 
 ## 0.1.13 — local only
 
