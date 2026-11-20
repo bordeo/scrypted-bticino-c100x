@@ -2,8 +2,8 @@
 
 ## 0.1.17 — unreleased
 
-- Talkback uplink handoff: never stop silence keepalive when Intercom arms. Gap-fill canned Speex/Opus/G.711 silence whenever no mic frame is sent within ~18 ms, so TX stays at ~50 pps while HomeKit return-audio ffmpeg connects or stalls (field: tx_pkts froze after `startIntercom` on 0.1.15/0.1.16).
-- Talkback pipeline: drain ffmpeg stderr (avoid pipe-full deadlock), timed stdout reads, low-delay/probesize flags; bound Speex PCM backlog.
+- Talkback uplink handoff: never stop silence keepalive when Intercom arms. Gap-fill canned Speex/Opus/G.711 silence when no mic is ready (~18 ms TX gap and no recent PCM / in-flight Speex encode), so TX stays alive while HomeKit return-audio ffmpeg connects or stalls (field: tx_pkts froze after `startIntercom` on 0.1.15/0.1.16) without injecting silence into healthy Speex talkback.
+- Talkback pipeline: drain ffmpeg stderr (avoid pipe-full deadlock), timed stdout reads (catch `asyncio.TimeoutError` on Py3.10), RTSP-only low-delay flags; bound Speex PCM backlog.
 - Version bump past published npm 0.1.16 (PR’s 0.1.16 never shipped from this tree).
 
 ## 0.1.16 — unreleased
