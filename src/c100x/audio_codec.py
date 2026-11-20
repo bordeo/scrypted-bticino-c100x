@@ -81,10 +81,11 @@ class OpusEncoder:
 
 
 class SpeexFfmpegEncoder:
-    """Encode 20 ms Speex frames via ffmpeg libspeex (raw ``spx`` demux is awkward).
+    """Encode 20 ms Speex frames via ffmpeg libspeex.
 
-    We ask ffmpeg for RTP packets on a local UDP port, then return the RTP
-    payload for the caller to re-packetize / SRTP-protect.
+    ffmpeg writes RTP to a local UDP port; we strip the header and return the
+    payload for SRTP. All encodes are serialized on ``_lock``. Silence is
+    warmed once and reused so the keepalive loop stays near ptime.
     """
 
     def __init__(
@@ -102,6 +103,8 @@ class SpeexFfmpegEncoder:
         self._transport: asyncio.DatagramTransport | None = None
         self._protocol: _RtpCollector | None = None
         self._local_port = 0
+        self._lock = asyncio.Lock()
+        self._silence_payload: bytes | None = None
 
     async def start(self) -> None:
         if not ffmpeg_has_encoder(self.ffmpeg_path, "libspeex"):
@@ -118,6 +121,10 @@ class SpeexFfmpegEncoder:
             "-hide_banner",
             "-loglevel",
             "error",
+            "-fflags",
+            "nobuffer",
+            "-flags",
+            "low_delay",
             "-f",
             "s16le",
             "-ar",
@@ -132,11 +139,13 @@ class SpeexFfmpegEncoder:
             str(self.sample_rate),
             "-ac",
             "1",
+            "-flush_packets",
+            "1",
             "-payload_type",
             str(self.payload_type),
             "-f",
             "rtp",
-            f"rtp://127.0.0.1:{self._local_port}",
+            f"rtp://127.0.0.1:{self._local_port}?pkt_size=1200",
         ]
         self._process = await asyncio.create_subprocess_exec(
             *command,
@@ -144,20 +153,46 @@ class SpeexFfmpegEncoder:
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
         )
+        # Prime and cache one silence frame for keepalive (may take >ptime once).
+        silence = await self._encode_unlocked(
+            b"\x00" * (self.frame_samples * 2), timeout=1.0
+        )
+        if silence:
+            self._silence_payload = silence
+        else:
+            _LOGGER.warning(
+                "Speex ffmpeg encoder started but silence warm-up timed out; "
+                "keepalive may gap until the first successful encode"
+            )
 
     async def encode(self, pcm_s16le: bytes) -> bytes | None:
+        async with self._lock:
+            return await self._encode_unlocked(pcm_s16le, timeout=0.08)
+
+    async def encode_silence(self) -> bytes | None:
+        if self._silence_payload is not None:
+            return self._silence_payload
+        async with self._lock:
+            if self._silence_payload is not None:
+                return self._silence_payload
+            payload = await self._encode_unlocked(
+                b"\x00" * (self.frame_samples * 2), timeout=0.08
+            )
+            if payload:
+                self._silence_payload = payload
+            return payload
+
+    async def _encode_unlocked(self, pcm_s16le: bytes, *, timeout: float) -> bytes | None:
         if not self._process or not self._process.stdin or not self._protocol:
             return None
         self._protocol.clear()
         self._process.stdin.write(pcm_s16le)
         await self._process.stdin.drain()
-        return await self._protocol.wait_payload(timeout=0.5)
-
-    async def encode_silence(self) -> bytes | None:
-        return await self.encode(b"\x00" * (self.frame_samples * 2))
+        return await self._protocol.wait_payload(timeout=timeout)
 
     async def close(self) -> None:
         process, self._process = self._process, None
+        self._silence_payload = None
         if process and process.stdin:
             with contextlib.suppress(Exception):
                 process.stdin.close()

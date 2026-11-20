@@ -200,6 +200,7 @@ class _MediaRtpProtocol(asyncio.DatagramProtocol):
         self._opus: OpusEncoder | None = None
         self._speex: SpeexFfmpegEncoder | None = None
         self._speex_pending = False
+        self._speex_chain: asyncio.Task[None] | None = None
         self._remote: tuple[str, int] | None = None
         self._talkback = False
         self._pcm = bytearray()
@@ -309,6 +310,9 @@ class _MediaRtpProtocol(asyncio.DatagramProtocol):
         self._talkback = enabled
         if not enabled:
             self._pcm.clear()
+            chain, self._speex_chain = self._speex_chain, None
+            if chain is not None:
+                chain.cancel()
 
     async def send_silence(self) -> None:
         if self._talkback or self._codec is None:
@@ -321,14 +325,17 @@ class _MediaRtpProtocol(asyncio.DatagramProtocol):
             elif name == "opus" and self._opus is not None:
                 self._send_payload(self._opus.encode_silence(), samples=self._opus.frame_samples)
             elif name == "speex" and self._speex is not None:
+                # Cached after warm-up so keepalive stays near ptime.
                 payload = await self._speex.encode_silence()
                 if payload:
-                    self._send_payload(payload, samples=self._fmt.frame_samples if self._fmt else 160)
+                    self._send_payload(
+                        payload, samples=self._fmt.frame_samples if self._fmt else 160
+                    )
         except (ValueError, pylibsrtp.Error, OSError):
             return
 
     def send_pcm(self, pcm: bytes) -> None:
-        """Queue PCM for talkback; Speex encoding is scheduled on the event loop."""
+        """Queue PCM for talkback; Speex frames are serialized on one task chain."""
         if not self._talkback or self._codec is None or self._fmt is None:
             return
         self._pcm.extend(pcm)
@@ -348,7 +355,15 @@ class _MediaRtpProtocol(asyncio.DatagramProtocol):
                     continue
                 self._send_payload(payload, samples=self._opus.frame_samples)
             elif name == "speex":
-                asyncio.create_task(self._send_speex_pcm(chunk))
+                prev = self._speex_chain
+
+                async def _run(frame: bytes = chunk, prior: asyncio.Task[None] | None = prev) -> None:
+                    if prior is not None:
+                        with contextlib.suppress(asyncio.CancelledError, Exception):
+                            await prior
+                    await self._send_speex_pcm(frame)
+
+                self._speex_chain = asyncio.create_task(_run())
 
     async def _send_speex_pcm(self, chunk: bytes) -> None:
         if self._speex is None or self._fmt is None:
@@ -409,10 +424,12 @@ class SrtpMediaSession:
         sip: SipClient,
         on_plain_rtp: RtpCallback | None = None,
         on_keyframe: Callable[[bytes], None] | None = None,
+        ffmpeg_path: str | None = None,
     ) -> None:
         self.sip = sip
         self.on_plain_rtp = on_plain_rtp
         self.on_keyframe = on_keyframe
+        self.ffmpeg_path = ffmpeg_path
         self.negotiated: NegotiatedSession | None = None
         self.audio: _MediaRtpProtocol | None = None
         self.video: _MediaRtpProtocol | None = None
@@ -568,7 +585,13 @@ class SrtpMediaSession:
             # Abort before INVITE so a finished end() during STUN/sockets does
             # not occupy the door's single monitoring slot.
             self._ensure_not_discarded()
-            answer = await self.sip.start_monitoring(offer.sdp)
+            try:
+                answer = await self.sip.start_monitoring(offer.sdp)
+            except Exception:
+                # Dialog may already be installed if ACK failed after the 200.
+                if self.sip.on_call_end == self.remote_ended:
+                    owned_dialog = self.sip._dialog
+                raise
             owned_dialog = self.sip._dialog
             # ``_ending`` clears when teardown finishes, so also require live
             # sockets / not-discarded (HomeKit reconnect during INVITE/486).
@@ -593,7 +616,7 @@ class SrtpMediaSession:
                 )
             self.audio.configure_audio(session)
             self.video.configure_video(session)
-            await self.audio.prepare_encoders()
+            await self.audio.prepare_encoders(self.ffmpeg_path)
             self.audio.prime_remote()
             self.video.prime_remote()
             if session.audio:

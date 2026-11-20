@@ -31,7 +31,7 @@ async def test_options_not_blocked_by_slow_previous_bye(monkeypatch) -> None:
     class SlowMedia:
         created = []
 
-        def __init__(self, sip, on_plain_rtp=None, on_keyframe=None):
+        def __init__(self, sip, on_plain_rtp=None, on_keyframe=None, ffmpeg_path=None):
             self.sip = sip
             self.negotiated = None
             self.ended = False

@@ -50,7 +50,7 @@ class FakeSip:
 class FakeMedia:
     created: list["FakeMedia"] = []
 
-    def __init__(self, sip, on_plain_rtp=None, on_keyframe=None) -> None:
+    def __init__(self, sip, on_plain_rtp=None, on_keyframe=None, ffmpeg_path=None) -> None:
         self.sip = sip
         self.negotiated = None
         self.started_with: str | None = None

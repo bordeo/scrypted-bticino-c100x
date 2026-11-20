@@ -529,12 +529,16 @@ class C100XDoorbell(
                         await self._end_media_unlocked()
                         if session.closed:
                             return
+                        ffmpeg_path: str | None = None
+                        with contextlib.suppress(Exception):
+                            ffmpeg_path = await scrypted_sdk.mediaManager.getFFmpegPath()
                         media = SrtpMediaSession(
                             sip,
                             on_plain_rtp=self._on_plain_rtp,
                             on_keyframe=lambda nal: asyncio.create_task(
                                 self._cache_keyframe_jpeg(nal)
                             ),
+                            ffmpeg_path=ffmpeg_path,
                         )
                         session_media[id(session)] = media
                         self._media = media

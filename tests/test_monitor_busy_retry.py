@@ -33,7 +33,7 @@ def _make(plugin_main, failures, *, status=486):
     class FakeMedia:
         created = []
 
-        def __init__(self, sip, on_plain_rtp=None, on_keyframe=None):
+        def __init__(self, sip, on_plain_rtp=None, on_keyframe=None, ffmpeg_path=None):
             self.sip = sip
             self.negotiated = None
             self.attempts = 0
