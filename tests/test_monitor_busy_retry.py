@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -49,6 +50,16 @@ def _make(plugin_main, failures, *, status=486):
             if self.attempts <= failures:
                 raise SipError(f"Monitoring call failed with SIP status {status}")
             self.started = True
+            # Minimal negotiated session (audio present so DESCRIBE can advertise it).
+            self.negotiated = SimpleNamespace(
+                audio=SimpleNamespace(
+                    port=6000,
+                    direction="sendrecv",
+                    protocol="RTP/SAVP",
+                    codec=lambda _names: SimpleNamespace(payload_type=8, name="PCMA"),
+                )
+            )
+            return self.negotiated
 
         async def end(self):
             self.ended = True
@@ -90,7 +101,7 @@ async def test_486_is_retried_until_the_door_is_free(monkeypatch) -> None:
     media = FakeMedia.created[0]
     assert media.started and media.attempts == 3
     assert logs.count("Door busy (486); retrying monitoring call") == 2
-    assert "Monitoring call started" in logs
+    assert any(line.startswith("Monitoring call started") for line in logs)
     w.close()
     await device._rtsp.stop()
 

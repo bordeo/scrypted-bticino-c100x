@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 import base64
+import re
 import secrets
 from dataclasses import dataclass, field
 
 SRTP_SUITE = "AES_CM_128_HMAC_SHA1_80"
 SRTP_KEY_BYTES = 30
+
+_CRYPTO_INLINE_RE = re.compile(
+    r"(a=crypto:\d+\s+\S+\s+inline:)[A-Za-z0-9+/=|_-]+",
+    re.IGNORECASE,
+)
 
 
 class SdpError(ValueError):
@@ -275,3 +281,64 @@ def build_receive_sdp(session: NegotiatedSession, *, include_audio: bool = True)
             f"a=crypto:{media.crypto.tag} {media.crypto.suite} inline:{media.crypto.inline}"
         )
     return "\r\n".join(lines) + "\r\n"
+
+
+def redact_sdp(value: bytes | str) -> str:
+    """Return SDP text with SDES inline keys stripped for safe console logging."""
+    text = value.decode("utf-8", errors="replace") if isinstance(value, bytes) else value
+    return _CRYPTO_INLINE_RE.sub(r"\1<redacted>", text)
+
+
+def explain_answer_audio(value: bytes | str) -> str:
+    """Summarize the answer's audio m-line for diagnostics (before/without accept)."""
+    text = value.decode("utf-8", errors="replace") if isinstance(value, bytes) else value
+    current_kind: str | None = None
+    audio_port: int | None = None
+    audio_proto = ""
+    audio_payloads: list[str] = []
+    direction = "sendrecv"
+    saw_audio = False
+    for raw_line in text.replace("\r\n", "\n").split("\n"):
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("m="):
+            parts = line[2:].split()
+            current_kind = parts[0].casefold() if parts else None
+            if current_kind == "audio":
+                saw_audio = True
+                try:
+                    audio_port = int(parts[1].split("/", 1)[0]) if len(parts) > 1 else None
+                except ValueError:
+                    audio_port = None
+                audio_proto = parts[2] if len(parts) > 2 else ""
+                audio_payloads = parts[3:] if len(parts) > 3 else []
+                direction = "sendrecv"
+            continue
+        if current_kind != "audio" or not line.startswith("a="):
+            continue
+        attribute = line[2:]
+        if attribute in {"sendrecv", "sendonly", "recvonly", "inactive"}:
+            direction = attribute
+    if not saw_audio:
+        return "no m=audio section in answer"
+    if audio_port == 0:
+        return f"m=audio port 0 (rejected) proto={audio_proto or '?'} direction={direction}"
+    payloads = ",".join(audio_payloads) if audio_payloads else "?"
+    return (
+        f"m=audio port={audio_port} proto={audio_proto or '?'} "
+        f"payloads={payloads} direction={direction}"
+    )
+
+
+def format_negotiated_audio(session: NegotiatedSession) -> str:
+    """Human-readable negotiated audio summary for logs / talkback errors."""
+    audio = session.audio
+    if audio is None:
+        return "none"
+    codec = audio.codec({"pcma", "pcmu"})
+    codec_name = codec.name.upper() if codec else "unsupported"
+    return (
+        f"port={audio.port} direction={audio.direction} "
+        f"codec={codec_name} proto={audio.protocol}"
+    )

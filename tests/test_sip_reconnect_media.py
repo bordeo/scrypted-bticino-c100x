@@ -65,6 +65,15 @@ class FakeMedia:
         if self.sip.closed:
             raise RuntimeError("SIP connection is not open")
         self.started_with = device_address
+        self.negotiated = SimpleNamespace(
+            audio=SimpleNamespace(
+                port=6000,
+                direction="sendrecv",
+                protocol="RTP/SAVP",
+                codec=lambda _names: SimpleNamespace(payload_type=8, name="PCMA"),
+            )
+        )
+        return self.negotiated
 
     async def end(self) -> None:
         self.ended = True

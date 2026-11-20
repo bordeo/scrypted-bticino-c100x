@@ -21,7 +21,15 @@ from typing import Any
 import pylibsrtp
 
 from .g711 import encode_g711, silence_frame
-from .sdp import Codec, NegotiatedSession, build_monitoring_offer, parse_answer
+from .sdp import (
+    Codec,
+    NegotiatedSession,
+    build_monitoring_offer,
+    explain_answer_audio,
+    format_negotiated_audio,
+    parse_answer,
+    redact_sdp,
+)
 from .sip import SipClient
 from .stun import StunError, binding_request, discover_mappings, is_stun, reply_binding
 
@@ -321,6 +329,9 @@ class SrtpMediaSession:
         self.audio: _MediaRtpProtocol | None = None
         self.video: _MediaRtpProtocol | None = None
         self.talkback_enabled = False
+        # Set when the answer omitted usable audio (port 0 / missing section).
+        self.audio_reject_reason: str | None = None
+        self.last_answer_redacted: str | None = None
         self._audio_rtcp: asyncio.DatagramTransport | None = None
         self._video_rtcp: asyncio.DatagramTransport | None = None
         self._primer: asyncio.Task[None] | None = None
@@ -329,6 +340,8 @@ class SrtpMediaSession:
         self._first_video = asyncio.Event()
         self._last_packet = 0.0
         self._ending = False
+        self._teardown_done = asyncio.Event()
+        self._teardown_done.set()
         self._last_keyframe: bytes | None = None
         self.sip.on_call_end = self.remote_ended
 
@@ -364,7 +377,11 @@ class SrtpMediaSession:
         if self.negotiated:
             raise MediaSessionError("A media session is already active")
         self._ending = False
+        self._teardown_done = asyncio.Event()
+        self._teardown_done.set()
         self.talkback_enabled = False
+        self.audio_reject_reason = None
+        self.last_answer_redacted = None
         audio_sockets, audio_port = await asyncio.to_thread(reserve_even_pair)
         video_sockets, video_port = await asyncio.to_thread(reserve_even_pair)
         try:
@@ -427,8 +444,23 @@ class SrtpMediaSession:
         )
         try:
             answer = await self.sip.start_monitoring(offer.sdp)
+            # Field diagnosis: keep the door's answer with SDES keys stripped.
+            self.last_answer_redacted = redact_sdp(answer).rstrip()
+            _LOGGER.info("Monitoring SDP answer (redacted):\n%s", self.last_answer_redacted)
+            audio_explain = explain_answer_audio(answer)
             session = parse_answer(answer, offer)
             self.negotiated = session
+            if session.audio is None:
+                self.audio_reject_reason = audio_explain
+                _LOGGER.warning(
+                    "Monitoring answer negotiated video only; audio not usable (%s)",
+                    audio_explain,
+                )
+            else:
+                self.audio_reject_reason = None
+                _LOGGER.info(
+                    "Monitoring negotiated audio: %s", format_negotiated_audio(session)
+                )
             self.audio.configure_audio(session)
             self.video.configure_video(session)
             self.audio.prime_remote()
@@ -456,16 +488,29 @@ class SrtpMediaSession:
     async def remote_ended(self) -> None:
         await self._teardown(send_bye=False)
 
+    def talkback_block_reason(self) -> str | None:
+        """Return why talkback cannot start, or None when it can."""
+        if self.negotiated is None or self._ending:
+            return "no active monitoring call"
+        if self.negotiated.audio is None:
+            detail = self.audio_reject_reason or "answer omitted usable audio"
+            return f"outdoor unit did not negotiate audio ({detail})"
+        if self.audio is None:
+            return "audio RTP socket is not configured"
+        if self.negotiated.audio.direction not in {"sendrecv", "recvonly"}:
+            return (
+                "outdoor unit audio direction is "
+                f"{self.negotiated.audio.direction} (need sendrecv or recvonly)"
+            )
+        if self.negotiated.audio.codec({"pcma", "pcmu"}) is None:
+            return "outdoor unit selected an unsupported audio codec"
+        return None
+
     async def set_talkback(self, enabled: bool) -> None:
-        if enabled and (self.negotiated is None or self.negotiated.audio is None or self.audio is None):
-            raise MediaSessionError("Talkback requires an active negotiated call")
-        if (
-            enabled
-            and self.negotiated
-            and self.negotiated.audio
-            and self.negotiated.audio.direction not in {"sendrecv", "recvonly"}
-        ):
-            raise MediaSessionError("The outdoor unit did not negotiate microphone reception")
+        if enabled:
+            reason = self.talkback_block_reason()
+            if reason is not None:
+                raise MediaSessionError(f"Talkback unavailable: {reason}")
         self.talkback_enabled = enabled
         if self.audio:
             self.audio.set_talkback(enabled)
@@ -516,9 +561,13 @@ class SrtpMediaSession:
             raise
 
     async def _teardown(self, *, send_bye: bool) -> None:
+        # Wait for an in-flight teardown instead of returning early: overlapping
+        # end() calls from on_connect / on_teardown must not race socket closes.
         if self._ending:
+            await self._teardown_done.wait()
             return
         self._ending = True
+        self._teardown_done = asyncio.Event()
         try:
             self.talkback_enabled = False
             if self.audio:
@@ -545,8 +594,11 @@ class SrtpMediaSession:
                 with contextlib.suppress(Exception):
                     await self.sip.end_monitoring()
             self.negotiated = None
+            self.audio_reject_reason = None
+            self.last_answer_redacted = None
         finally:
             self._ending = False
+            self._teardown_done.set()
 
 
 def next_reconnect_delay(attempt: int) -> float:

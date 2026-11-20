@@ -48,7 +48,7 @@ from c100x.const import (
 )
 from c100x.models import SipAccount
 from c100x.rtsp_server import RtspServer, RtspSession
-from c100x.sdp import NegotiatedSession, SdpError
+from c100x.sdp import NegotiatedSession, SdpError, format_negotiated_audio
 from c100x.sip import SipClient, SipError
 from c100x.srtp_media import MediaSessionError, SrtpMediaSession, new_client_id, next_reconnect_delay
 from c100x.talkback import TalkbackError, TalkbackPipeline
@@ -268,9 +268,14 @@ class C100XDoorbell(
         self._talkback: TalkbackPipeline | None = None
         self._last_jpeg: bytes | None = None
         self._session_lock = asyncio.Lock()
+        # Serialize talkback/media teardown so overlapping on_connect / on_teardown
+        # cannot clear a newer session (Bugbot race on non-reentrant _end_media).
+        self._media_lock = asyncio.Lock()
         self._ring_reset: asyncio.TimerHandle | None = None
         self._seen_call_ids: set[str] = set()
         self._prebuffer_warned = False
+        self._logged_first_video = False
+        self._logged_first_audio = False
 
     # --- Settings ---------------------------------------------------------
 
@@ -480,37 +485,47 @@ class C100XDoorbell(
         # current *at connect time*. The server can outlive a SIP reconnect
         # (settings save, supervisor), so it must never capture a SipClient.
         session_media: dict[int, SrtpMediaSession] = {}
+        session_ready: dict[int, asyncio.Event] = {}
 
         async def on_connect(session: RtspSession) -> None:
-            # Do not block the RTSP handshake on the SIP INVITE. Scrypted's
-            # RtspClient times out OPTIONS after 10s, and a failed INVITE
-            # used to close the TCP socket before OPTIONS was answered.
+            # Do not block OPTIONS on SIP BYE or INVITE. Scrypted's RtspClient
+            # times out OPTIONS after 10s; awaiting talkback stop + BYE here
+            # (Bugbot) exceeded that on HomeKit reconnect during a live view.
             # DEVADDR must be the visible external-unit module id (HA 0.3.3),
             # not the gateway id — wrong DEVADDR yields SIP 486 Busy Here.
+            # HA establishes monitoring before exposing playback; we mirror that
+            # by gating DESCRIBE on the ready event (OPTIONS stays instant).
 
             sip = self.plugin.sip
             if sip is None or not sip.registered:
                 self.print("Monitoring call failed: SIP is not registered yet")
                 await session.close()
                 return
-            await self._end_media()
             media = SrtpMediaSession(
                 sip,
                 on_plain_rtp=self._on_plain_rtp,
                 on_keyframe=lambda nal: asyncio.create_task(self._cache_keyframe_jpeg(nal)),
             )
-            self._media = media
+            ready = asyncio.Event()
             session_media[id(session)] = media
-            self._logged_first_rtp = False
+            session_ready[id(session)] = ready
+            self._logged_first_video = False
+            self._logged_first_audio = False
 
             async def _start_monitoring() -> None:
                 try:
+                    # Previous call teardown (BYE) happens here — not before OPTIONS.
+                    async with self._media_lock:
+                        await self._end_media_unlocked()
+                        if session.closed:
+                            return
+                        self._media = media
                     self.print("Starting monitoring call")
                     device_address = await self.plugin.monitoring_device_address()
                     deadline = asyncio.get_running_loop().time() + MONITOR_BUSY_RETRY_SECONDS
                     while True:
                         try:
-                            await media.start(device_address)
+                            session_neg = await media.start(device_address)
                             break
                         except SipError as err:
                             # 486: the door already has a monitoring call (for example
@@ -526,56 +541,86 @@ class C100XDoorbell(
                     if session.closed:
                         await media.end()
                         return
-                    self.print("Monitoring call started")
+                    redacted = getattr(media, "last_answer_redacted", None)
+                    if redacted:
+                        self.print("Monitoring SDP answer (redacted):\n" + redacted)
+                    if session_neg.audio is None:
+                        reason = (
+                            getattr(media, "audio_reject_reason", None)
+                            or "answer omitted usable audio"
+                        )
+                        self.print(f"Monitoring call started (video only; {reason})")
+                    else:
+                        self.print(
+                            "Monitoring call started "
+                            f"(audio {format_negotiated_audio(session_neg)})"
+                        )
                 except Exception as err:
                     self.print(f"Monitoring call failed: {_err_summary(err)}")
                     await session.close()
+                finally:
+                    ready.set()
 
             asyncio.create_task(_start_monitoring())
 
+        async def on_describe_ready(session: RtspSession) -> None:
+            ready = session_ready.get(id(session))
+            if ready is None:
+                return
+            # Wait for INVITE/answer so DESCRIBE can omit a dead audio track.
+            # Cap wait so a stuck INVITE cannot hang the RTSP client forever.
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(ready.wait(), timeout=MONITOR_BUSY_RETRY_SECONDS + 5)
+
         async def on_teardown(session: RtspSession) -> None:
+            session_ready.pop(id(session), None)
             media = session_media.pop(id(session), None)
             if media is None:
                 return
-            if self._media is media:
-                await self._end_media()
-            else:
-                with contextlib.suppress(Exception):
-                    await media.end()
+            async with self._media_lock:
+                if self._media is media:
+                    await self._end_media_unlocked()
+                else:
+                    with contextlib.suppress(Exception):
+                        await media.end()
 
         def sdp_builder(session: RtspSession) -> str:
             media = session_media.get(id(session))
             negotiated: NegotiatedSession | None = media.negotiated if media else None
-            audio_pt = 8
-            audio_name = "PCMA"
+            lines = [
+                "v=0",
+                "o=- 0 0 IN IP4 127.0.0.1",
+                "s=BTicino C100X",
+                "c=IN IP4 127.0.0.1",
+                "t=0 0",
+                "m=video 0 RTP/AVP 96",
+                "a=rtpmap:96 H264/90000",
+                "a=fmtp:96 packetization-mode=1;profile-level-id=42e01f",
+                "a=control:trackID=0",
+                "a=sendonly",
+            ]
+            # Only advertise RTSP audio when the door negotiated it — otherwise
+            # HomeKit/ffmpeg SETs UP pcm_alaw and then writes nothing.
             if negotiated and negotiated.audio:
                 codec = negotiated.audio.codec({"pcma", "pcmu"})
                 if codec:
                     audio_pt = codec.payload_type
                     audio_name = codec.name.upper()
-            return "\r\n".join(
-                [
-                    "v=0",
-                    "o=- 0 0 IN IP4 127.0.0.1",
-                    "s=BTicino C100X",
-                    "c=IN IP4 127.0.0.1",
-                    "t=0 0",
-                    "m=video 0 RTP/AVP 96",
-                    "a=rtpmap:96 H264/90000",
-                    "a=fmtp:96 packetization-mode=1;profile-level-id=42e01f",
-                    "a=control:trackID=0",
-                    "a=sendonly",
-                    f"m=audio 0 RTP/AVP {audio_pt}",
-                    f"a=rtpmap:{audio_pt} {audio_name}/8000",
-                    "a=control:trackID=1",
-                    "a=sendonly",
-                    "",
-                ]
-            )
+                    lines.extend(
+                        [
+                            f"m=audio 0 RTP/AVP {audio_pt}",
+                            f"a=rtpmap:{audio_pt} {audio_name}/8000",
+                            "a=control:trackID=1",
+                            "a=sendonly",
+                        ]
+                    )
+            lines.append("")
+            return "\r\n".join(lines)
 
         server = RtspServer(
             on_connect=on_connect,
             on_teardown=on_teardown,
+            on_describe_ready=on_describe_ready,
             sdp_builder=sdp_builder,
             idle_seconds=MEDIA_IDLE_SECONDS,
             on_log=self.print,
@@ -586,6 +631,11 @@ class C100XDoorbell(
 
     async def _end_media(self) -> None:
         """Stop talkback and end the current monitoring call, if any."""
+        async with self._media_lock:
+            await self._end_media_unlocked()
+
+    async def _end_media_unlocked(self) -> None:
+        """Caller must hold ``_media_lock``."""
         talkback, self._talkback = self._talkback, None
         if talkback:
             with contextlib.suppress(Exception):
@@ -608,9 +658,12 @@ class C100XDoorbell(
         await self._end_media()
 
     async def _on_plain_rtp(self, packet: bytes, kind: str) -> None:
-        if not getattr(self, "_logged_first_rtp", False):
-            self._logged_first_rtp = True
-            self.print(f"First RTP packet: {kind}")
+        if kind == "video" and not self._logged_first_video:
+            self._logged_first_video = True
+            self.print("First RTP packet: video")
+        elif kind == "audio" and not self._logged_first_audio:
+            self._logged_first_audio = True
+            self.print("First RTP packet: audio")
         if self._rtsp:
             await self._rtsp.forward_rtp(packet, kind)
 
@@ -621,6 +674,11 @@ class C100XDoorbell(
             raise TalkbackError("Talkback is disabled; enable it in device settings")
         if not self._media or not self._media.active:
             raise TalkbackError("Talkback requires an active viewing call")
+        block = self._media.talkback_block_reason()
+        if block is not None:
+            message = f"Talkback unavailable: {block}"
+            self.print(message)
+            raise TalkbackError(message)
         ffmpeg_input = await scrypted_sdk.mediaManager.convertMediaObjectToJSON(
             media, ScryptedMimeTypes.FFmpegInput.value
         )
@@ -628,7 +686,11 @@ class C100XDoorbell(
             raise TalkbackError("Expected FFmpegInput JSON for talkback")
         ffmpeg = await scrypted_sdk.mediaManager.getFFmpegPath()
         pipeline = TalkbackPipeline(self._media)
-        await pipeline.start(ffmpeg, ffmpeg_input)
+        try:
+            await pipeline.start(ffmpeg, ffmpeg_input)
+        except MediaSessionError as err:
+            self.print(str(err))
+            raise TalkbackError(str(err)) from err
         self._talkback = pipeline
 
     async def stopIntercom(self) -> None:

@@ -19,6 +19,7 @@ _LOGGER = logging.getLogger(__name__)
 
 OnConnect = Callable[["RtspSession"], Awaitable[None]]
 OnTeardown = Callable[["RtspSession"], Awaitable[None]]
+OnDescribeReady = Callable[["RtspSession"], Awaitable[None]]
 OnLog = Callable[[str], None]
 
 
@@ -77,12 +78,16 @@ class RtspServer:
         *,
         on_connect: OnConnect | None = None,
         on_teardown: OnTeardown | None = None,
+        on_describe_ready: OnDescribeReady | None = None,
         sdp_builder: Callable[["RtspSession"], str] | None = None,
         idle_seconds: float = 30.0,
         on_log: OnLog | None = None,
     ) -> None:
         self.on_connect = on_connect
         self.on_teardown = on_teardown
+        # Optional gate before DESCRIBE so the SDP can reflect negotiated codecs
+        # (HA waits for monitoring before exposing playback). Must not run on OPTIONS.
+        self.on_describe_ready = on_describe_ready
         self.sdp_builder = sdp_builder or _default_sdp
         self.idle_seconds = idle_seconds
         self.on_log = on_log
@@ -213,6 +218,9 @@ class RtspServer:
                     extra={"Public": "OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN"},
                 )
             elif method == "DESCRIBE":
+                if self.on_describe_ready:
+                    with contextlib.suppress(Exception):
+                        await self.on_describe_ready(session)
                 sdp = self.sdp_builder(session)
                 await _respond(
                     session,
@@ -228,9 +236,11 @@ class RtspServer:
                 transport = headers.get("transport", "")
                 transport_l = transport.lower()
                 # Only TCP interleaved is implemented. Scrypted's RtspClient
-                # tries UDP first and falls back to TCP only on RtspStatusError.
-                # A 200 with a TCP Transport for a UDP SETUP makes it skip the
-                # fallback, so the player never receives RTP.
+                # (and HomeKit's ffmpeg pull) try UDP first and fall back to TCP
+                # only on RtspStatusError. A 200 with a TCP Transport for a UDP
+                # SETUP makes the client skip the fallback, so the player never
+                # receives RTP. Implementing real UDP RTP is not cheap/safe here;
+                # the two 461s before interleaved SETUP are expected and correct.
                 if "interleaved=" not in transport_l and "/tcp" not in transport_l:
                     self._log("RTSP SETUP rejected: 461 Unsupported Transport")
                     await _respond(session, 461, "Unsupported Transport")

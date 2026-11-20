@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.10 — unreleased
+
+- Talkback / door audio diagnosis and hardening for HomeKit remote views:
+  - Print each monitoring SIP answer SDP with `a=crypto` inline keys redacted, plus a one-line audio summary (`port` / `direction` / codec, or why audio was omitted).
+  - `startIntercom` reports a clear reason when audio was not negotiated (port 0 / missing section / direction / codec) instead of a bare `Talkback requires an active negotiated call` traceback.
+  - Align closer with ha-bticino-c100x: do not block RTSP `OPTIONS` on previous-call BYE; gate `DESCRIBE` on monitoring completion so the RTSP SDP only advertises audio when the door negotiated it (avoids HomeKit/ffmpeg setting up a dead `pcm_alaw` track).
+  - Serialize media teardown and make `SrtpMediaSession.end()` wait for an in-flight teardown (Bugbot races on overlapping reconnect).
+- RTSP `461 Unsupported Transport` on UDP SETUP is intentional: only TCP interleaved is implemented; accepting UDP with a TCP transport reply breaks Scrypted's fallback. The two 461s before interleaved SETUP are expected.
+
 ## 0.1.9 — unreleased
 
 - Retry a monitoring INVITE for up to 15 s (every 2 s) when the door answers `486 Busy Here`, instead of failing the HomeKit view at once. The door allows one monitoring call; Home Assistant keeps its call about 10 s after its last viewer leaves.
