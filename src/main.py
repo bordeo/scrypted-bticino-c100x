@@ -151,9 +151,12 @@ class C100XDoorbell(
         # Read default from the const module at call time so tests can patch it.
         from c100x import const as _const
 
+        storage = getattr(self.plugin, "storage", None)
+        if storage is None:
+            return int(_const.DEFAULT_DOOR_AUDIO_GAIN_DB)
         return clamp_door_audio_gain_db(
             _json_get(
-                self.plugin.storage,
+                storage,
                 CONF_DOOR_AUDIO_GAIN_DB,
                 _const.DEFAULT_DOOR_AUDIO_GAIN_DB,
             )
@@ -367,9 +370,9 @@ class C100XDoorbell(
 
     async def getVideoStreamOptions(self) -> list[ResponseMediaStreamOptions]:
         # Prefer Opus (official Door Entry offer); Scrypted/HomeKit remux as needed.
-        # When door-audio gain is active we re-encode Opus ourselves for RTSP.
+        # When door-audio gain is configured we re-encode Opus ourselves for RTSP.
         audio: dict[str, Any] = {"codec": "opus", "sampleRate": 48000}
-        if self._audio_gain and self._audio_gain.active:
+        if self._door_audio_gain_db() > 0:
             audio = {"codec": "opus", "sampleRate": 48000}
         elif self._media and self._media.active:
             codec = self._media.selected_audio_codec()
@@ -533,11 +536,12 @@ class C100XDoorbell(
             ready = session_ready.get(id(session))
             if ready is None:
                 return
-            # Best-effort wait for INVITE so DESCRIBE can use the negotiated
-            # codec. Audio is always advertised (default Opus) even on timeout
-            # so a slow BYE/486 window cannot leave HomeKit without an audio track.
+            # Wait through the 486 retry window so DESCRIBE sees negotiated
+            # codecs / gain Opus when possible. Still fall through with default
+            # Opus so a slow door cannot leave HomeKit without an audio track.
+            wait_s = MONITOR_BUSY_RETRY_SECONDS + 3.0
             with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(ready.wait(), timeout=12.0)
+                await asyncio.wait_for(ready.wait(), timeout=wait_s)
 
         async def on_teardown(session: RtspSession) -> None:
             session_ready.pop(id(session), None)
@@ -560,8 +564,10 @@ class C100XDoorbell(
             audio_pt = 96
             audio_rtpmap = "opus/48000/2"
             audio_fmtp = "a=fmtp:96 useinbandfec=1"
-            if self._audio_gain and self._audio_gain.active:
-                # In-plugin gain path always emits Opus on the RTSP track.
+            # Gain path always re-encodes to Opus PT 96 — advertise that as soon
+            # as the setting is on, not only after the transcoder finishes starting
+            # (DESCRIBE must not lock Speex/pt=98 then receive Opus/pt=96).
+            if self._door_audio_gain_db() > 0:
                 audio_pt = DoorAudioGainTranscoder.OUTPUT_PAYLOAD_TYPE
                 audio_rtpmap = DoorAudioGainTranscoder.OUTPUT_RTPMAP
                 audio_fmtp = f"a=fmtp:{audio_pt} useinbandfec=1"

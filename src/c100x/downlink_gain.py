@@ -68,7 +68,10 @@ def _rtpmap_for_codec(codec: Any) -> tuple[int, str]:
 class DoorAudioGainTranscoder:
     """ffmpeg RTP→(volume+alimiter)→Opus RTP bridge for one monitoring call."""
 
-    OUTPUT_PAYLOAD_TYPE = 97
+    # PT 96 matches the pre-negotiation RTSP DESCRIBE default (Opus). Using a
+    # different PT (e.g. 97) raced DESCRIBE: HomeKit locked pt=96 then dropped
+    # gained packets when the transcoder came up later (default gain is +12).
+    OUTPUT_PAYLOAD_TYPE = 96
     OUTPUT_RTPMAP = "opus/48000/2"
 
     def __init__(

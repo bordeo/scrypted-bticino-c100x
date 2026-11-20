@@ -194,28 +194,12 @@ async def test_rtsp_udp_setup_accepted() -> None:
         await server.stop()
 
 
-async def _drain_interleaved(reader: asyncio.StreamReader, *, rounds: int = 32) -> None:
-    """Read interleaved RTP so the TCP send buffer does not stall the server."""
-    _eof = (TimeoutError, asyncio.TimeoutError, asyncio.exceptions.IncompleteReadError)
-    for _ in range(rounds):
-        try:
-            dollar = await asyncio.wait_for(reader.readexactly(1), timeout=0.02)
-        except _eof:
-            return
-        if dollar != b"$":
-            return
-        try:
-            ch_len = await reader.readexactly(3)
-            length = int.from_bytes(ch_len[1:3], "big")
-            await reader.readexactly(length)
-        except _eof:
-            return
-
-
 @pytest.mark.asyncio
-async def test_rtsp_playing_idle_refreshed_by_rtp() -> None:
-    """RTP activity must keep the session alive past a short idle window."""
-    server = RtspServer(idle_seconds=0.8)
+async def test_rtsp_forward_rtp_refreshes_last_activity() -> None:
+    """forward_rtp must touch last_activity so the idle timer stays alive."""
+    import time
+
+    server = RtspServer(idle_seconds=30.0)
     url = await server.start()
     reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
     try:
@@ -231,24 +215,44 @@ async def test_rtsp_playing_idle_refreshed_by_rtp() -> None:
         await _rtsp_exchange(
             reader, writer, [f"PLAY {url} RTSP/1.0", "CSeq: 2", "Session: 1"]
         )
-        assert server.session is not None and server.session.playing
-
+        session = server.session
+        assert session is not None and session.playing
+        session.last_activity = time.monotonic() - 10.0
         packet = serialize_rtp(
             payload_type=96, sequence=1, timestamp=0, ssrc=1, payload=b"\x65"
         )
-        # Keep RTP flowing longer than idle_seconds; drain so TCP does not back-pressure.
-        for _ in range(10):
-            await server.forward_rtp(packet, "video")
-            await _drain_interleaved(reader)
-            await asyncio.sleep(0.12)
-            assert server.session is not None and not server.session.closed
+        await server.forward_rtp(packet, "video")
+        assert session.last_activity >= time.monotonic() - 1.0
+        assert not session.closed
+    finally:
+        writer.close()
+        with contextlib.suppress(Exception):
+            await writer.wait_closed()
+        await server.stop()
 
-        resp = await _rtsp_exchange(
+
+@pytest.mark.asyncio
+async def test_rtsp_idle_timeout_without_rtp() -> None:
+    """With no RTP/keepalive, a short idle window tears the session down."""
+    server = RtspServer(idle_seconds=0.25)
+    url = await server.start()
+    reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
+    try:
+        await _rtsp_exchange(
             reader,
             writer,
-            [f"GET_PARAMETER {url} RTSP/1.0", "CSeq: 3", "Session: 1"],
+            [
+                f"SETUP {url}trackID=0 RTSP/1.0",
+                "CSeq: 1",
+                "Transport: RTP/AVP/TCP;unicast;interleaved=0-1",
+            ],
         )
-        assert b"200 OK" in resp
+        await _rtsp_exchange(
+            reader, writer, [f"PLAY {url} RTSP/1.0", "CSeq: 2", "Session: 1"]
+        )
+        assert server.session is not None
+        await asyncio.sleep(0.6)
+        assert server.session is None or server.session.closed
     finally:
         writer.close()
         with contextlib.suppress(Exception):
