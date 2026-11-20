@@ -14,6 +14,12 @@ CONF_GATEWAY_ID = "gateway_id"
 CONF_EMAIL = "email"
 CONF_PASSWORD = "password"
 CONF_ENABLE_TALKBACK = "enable_talkback"
+CONF_DOOR_AUDIO_GAIN_DB = "door_audio_gain_db"
+CONF_EXPOSE_DOOR_OPENER = "expose_door_opener"
+DEFAULT_DOOR_AUDIO_GAIN_DB = 12
+DOOR_AUDIO_GAIN_MIN_DB = 0
+DOOR_AUDIO_GAIN_MAX_DB = 24
+DOOR_RELOCK_SECONDS = 3.0
 
 API_BASE = "https://api.developer.legrand.com"
 API_SUBSCRIPTION_KEY = "f36968e522bf4ec3877fa491109d3d14"
@@ -45,7 +51,7 @@ SIP_KEEPALIVE_PING = b"\r\n\r\n"
 SIP_KEEPALIVE_PONG = b"\r\n"
 # Short reconnect backoff after refresh/socket failure (seconds).
 SIP_RECONNECT_BACKOFF = (1, 2, 5, 30)
-SIP_USER_AGENT = "scrypted-bticino-c100x/0.1.12"
+SIP_USER_AGENT = "scrypted-bticino-c100x/0.1.14"
 SIP_CLIENT_NAME = "Scrypted"
 
 # Certificate profile used by the official Classe 100X application.

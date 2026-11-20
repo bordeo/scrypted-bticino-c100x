@@ -21,6 +21,7 @@ def install() -> tuple[types.ModuleType, types.ModuleType]:
             self.id = nativeId or "plugin"
             self.interfaces = []
             self.binaryState = False
+            self.lockState = None
 
         async def onDeviceEvent(self, *a, **k):
             return None
@@ -36,15 +37,22 @@ def install() -> tuple[types.ModuleType, types.ModuleType]:
         def __init__(self, value):
             self.value = value
 
+    class LockState:
+        Locked = _Enum("Locked")
+        Unlocked = _Enum("Unlocked")
+        Jammed = _Enum("Jammed")
+
     class ScryptedInterface:
         VideoCamera = _Enum("VideoCamera")
         Camera = _Enum("Camera")
         BinarySensor = _Enum("BinarySensor")
         Settings = _Enum("Settings")
         Intercom = _Enum("Intercom")
+        Lock = _Enum("Lock")
 
     class ScryptedDeviceType:
         Doorbell = _Enum("Doorbell")
+        Lock = _Enum("Lock")
 
     class ScryptedMimeTypes:
         MediaStreamUrl = _Enum("text/x-media-url")
@@ -56,6 +64,8 @@ def install() -> tuple[types.ModuleType, types.ModuleType]:
         "Camera": type("Camera", (), {}),
         "DeviceProvider": type("DeviceProvider", (), {}),
         "Intercom": type("Intercom", (), {}),
+        "Lock": type("Lock", (), {}),
+        "LockState": LockState,
         "MediaObject": type("MediaObject", (), {}),
         "RequestMediaStreamOptions": dict,
         "ResponseMediaStreamOptions": dict,

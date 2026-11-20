@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.14 — unreleased
+
+- Door audio gain: plugin setting **Door audio gain (dB)** (default +12, range 0–24). Downlink Speex/Opus/G.711 is still SRTP→RTP into local RTSP; HomeKit’s remux has no plugin `volume=` hook, so when gain > 0 the plugin transcodes in-path (ffmpeg decode → `volume=NdB,alimiter` → Opus) and advertises Opus on the RTSP audio track. Gain 0 keeps RTP passthrough.
+- HomeKit door opener: opt-in provider setting **Expose door opener to HomeKit** (default on) publishes each official-topology visible Lock as a Scrypted `Lock` device. `lock()` is a no-op (stays Locked); `unlock()` sends the same SIP `MESSAGE` / `lock.setStatus` apriporta as ha-bticino-c100x, logs a UTC timestamp, then auto-returns to Locked after 3 s.
+
+## 0.1.13 — local only
+
+- Placeholder JPEG swap + version bump (published locally; not on this branch).
+
 ## 0.1.12 — unreleased
 
 - Field 0.1.11 (Speex accepted): door opens downlink only after upstream audio. Send continuous 20 ms Speex/8000 silence (canned libspeex frame, SRTP) from call start; log RTP audio rx/tx counters every 5 s for the first 30 s.
