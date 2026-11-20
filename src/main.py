@@ -19,6 +19,8 @@ from scrypted_sdk.types import (
     Camera,
     DeviceProvider,
     Intercom,
+    Lock,
+    LockState,
     MediaObject,
     RequestMediaStreamOptions,
     ResponseMediaStreamOptions,
@@ -36,21 +38,46 @@ from c100x.auth import AuthenticationError, C100XAuth, log_auth_failure
 from c100x.certificate import certificate_expiry, provision_certificate
 from c100x.const import (
     CERTIFICATE_RENEWAL_DAYS,
+    CONF_DOOR_AUDIO_GAIN_DB,
     CONF_EMAIL,
+    CONF_ENABLE_ECHO_CANCELLATION,
     CONF_ENABLE_TALKBACK,
+    CONF_EXPOSE_DOOR_OPENER,
     CONF_GATEWAY_ID,
     CONF_HOME_ID,
+    CONF_LATITUDE,
+    CONF_LONGITUDE,
     CONF_PASSWORD,
+    DEFAULT_DOOR_AUDIO_GAIN_DB,
+    DOOR_AUDIO_GAIN_MAX_DB,
+    DOOR_AUDIO_GAIN_MIN_DB,
+    DOOR_RELOCK_SECONDS,
     MEDIA_IDLE_SECONDS,
+    MONITOR_BUSY_RETRY_INTERVAL,
+    MONITOR_BUSY_RETRY_SECONDS,
     RING_ACTIVE_SECONDS,
 )
+from c100x.door_audio_aec import DoorAudioAecTranscoder
+from c100x.downlink_gain import (
+    DoorAudioGainTranscoder,
+    clamp_door_audio_gain_db,
+)
+from c100x.echo_cancel import EchoCanceller, speexdsp_available
 from c100x.models import SipAccount
 from c100x.rtsp_server import RtspServer, RtspSession
-from c100x.sdp import NegotiatedSession, SdpError
+from c100x.sdp import NegotiatedSession, SdpError, format_negotiated_audio, select_audio_codec
 from c100x.sip import SipClient, SipError
+from c100x.snapshot import render_snapshot_jpeg
 from c100x.srtp_media import MediaSessionError, SrtpMediaSession, new_client_id, next_reconnect_delay
+from c100x.sun import (
+    DEFAULT_LATITUDE,
+    DEFAULT_LONGITUDE,
+    DEFAULT_TIMEZONE,
+    clamp_latitude,
+    clamp_longitude,
+)
 from c100x.talkback import TalkbackError, TalkbackPipeline
-from c100x.topology import visible_external_units
+from c100x.topology import visible_external_units, visible_lock_modules
 
 _LOGGER = logging.getLogger("scrypted-bticino-c100x")
 
@@ -67,171 +94,6 @@ _SECRET_KEYS = frozenset(
         "client_id",
     }
 )
-
-PLACEHOLDER_JPEG = bytes(
-    [
-        0xFF,
-        0xD8,
-        0xFF,
-        0xE0,
-        0x00,
-        0x10,
-        0x4A,
-        0x46,
-        0x49,
-        0x46,
-        0x00,
-        0x01,
-        0x01,
-        0x00,
-        0x00,
-        0x01,
-        0x00,
-        0x01,
-        0x00,
-        0x00,
-        0xFF,
-        0xDB,
-        0x00,
-        0x43,
-        0x00,
-        0x08,
-        0x06,
-        0x06,
-        0x07,
-        0x06,
-        0x05,
-        0x08,
-        0x07,
-        0x07,
-        0x07,
-        0x09,
-        0x09,
-        0x08,
-        0x0A,
-        0x0C,
-        0x14,
-        0x0D,
-        0x0C,
-        0x0B,
-        0x0B,
-        0x0C,
-        0x19,
-        0x12,
-        0x13,
-        0x0F,
-        0x14,
-        0x1D,
-        0x1A,
-        0x1F,
-        0x1E,
-        0x1D,
-        0x1A,
-        0x1C,
-        0x1C,
-        0x20,
-        0x24,
-        0x2E,
-        0x27,
-        0x20,
-        0x22,
-        0x2C,
-        0x23,
-        0x1C,
-        0x1C,
-        0x28,
-        0x37,
-        0x29,
-        0x2C,
-        0x30,
-        0x31,
-        0x34,
-        0x34,
-        0x34,
-        0x1F,
-        0x27,
-        0x39,
-        0x3D,
-        0x38,
-        0x32,
-        0x3C,
-        0x2E,
-        0x33,
-        0x34,
-        0x32,
-        0xFF,
-        0xC0,
-        0x00,
-        0x0B,
-        0x08,
-        0x00,
-        0x01,
-        0x00,
-        0x01,
-        0x01,
-        0x01,
-        0x11,
-        0x00,
-        0xFF,
-        0xC4,
-        0x00,
-        0x14,
-        0x00,
-        0x01,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x03,
-        0xFF,
-        0xC4,
-        0x00,
-        0x14,
-        0x10,
-        0x01,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0xFF,
-        0xDA,
-        0x00,
-        0x08,
-        0x01,
-        0x01,
-        0x00,
-        0x00,
-        0x3F,
-        0x00,
-        0x7F,
-        0xFF,
-        0xD9,
-    ]
-)
-
 
 def _json_get(storage, key: str, default=None):
     try:
@@ -266,16 +128,51 @@ class C100XDoorbell(
         self._talkback: TalkbackPipeline | None = None
         self._last_jpeg: bytes | None = None
         self._session_lock = asyncio.Lock()
+        # Serialize talkback/media teardown so overlapping on_connect / on_teardown
+        # cannot clear a newer session (Bugbot race on non-reentrant _end_media).
+        self._media_lock = asyncio.Lock()
         self._ring_reset: asyncio.TimerHandle | None = None
         self._seen_call_ids: set[str] = set()
         self._prebuffer_warned = False
+        self._logged_first_video = False
+        self._logged_first_audio = False
+        self._audio_gain: DoorAudioGainTranscoder | DoorAudioAecTranscoder | None = None
+        self._echo: EchoCanceller | None = None
 
     # --- Settings ---------------------------------------------------------
 
     def _talkback_enabled(self) -> bool:
-        return bool(_json_get(self.plugin.storage, CONF_ENABLE_TALKBACK, False))
+        try:
+            return bool(_json_get(self.plugin.storage, CONF_ENABLE_TALKBACK, False))
+        except Exception:
+            return False
+
+    def _echo_cancellation_enabled(self) -> bool:
+        try:
+            return bool(
+                _json_get(self.plugin.storage, CONF_ENABLE_ECHO_CANCELLATION, False)
+            )
+        except Exception:
+            return False
+
+    def _door_audio_gain_db(self) -> int:
+        # Read default from the const module at call time so tests can patch it.
+        from c100x import const as _const
+
+        storage = getattr(self.plugin, "storage", None)
+        if storage is None:
+            return int(_const.DEFAULT_DOOR_AUDIO_GAIN_DB)
+        return clamp_door_audio_gain_db(
+            _json_get(
+                storage,
+                CONF_DOOR_AUDIO_GAIN_DB,
+                _const.DEFAULT_DOOR_AUDIO_GAIN_DB,
+            )
+        )
 
     async def getSettings(self) -> list[Setting]:
+        from c100x import const as _const
+
         settings: list[Setting] = [
             {
                 "key": "info",
@@ -292,6 +189,31 @@ class C100XDoorbell(
                 "description": (
                     "Off by default. When enabled, this device advertises Intercom so "
                     "HomeKit can send return audio. Requires an active viewing call."
+                ),
+            },
+            {
+                "key": CONF_DOOR_AUDIO_GAIN_DB,
+                "title": "Door audio gain (dB)",
+                "type": "number",
+                "value": self._door_audio_gain_db(),
+                "description": (
+                    f"Boost door→HomeKit audio ({DOOR_AUDIO_GAIN_MIN_DB}–"
+                    f"{DOOR_AUDIO_GAIN_MAX_DB} dB, default +{_const.DEFAULT_DOOR_AUDIO_GAIN_DB}). "
+                    "Applied in-plugin (decode → volume+alimiter → Opus) because RTSP "
+                    "passthrough cannot set ffmpeg volume= for HomeKit remux. "
+                    "0 keeps Speex/Opus RTP passthrough. Takes effect on the next call."
+                ),
+            },
+            {
+                "key": CONF_ENABLE_ECHO_CANCELLATION,
+                "title": "Echo cancellation",
+                "type": "boolean",
+                "value": self._echo_cancellation_enabled(),
+                "description": (
+                    "Off by default. When on, SpeexDSP AEC cleans door→phone audio using "
+                    "your uplink PCM as the reference (helps when the outdoor speaker "
+                    "couples into the door mic). Requires libspeexdsp on the host. "
+                    "Takes effect on the next call; gain still applies."
                 ),
             },
         ]
@@ -316,6 +238,20 @@ class C100XDoorbell(
             enabled = value in (True, "true", "True", 1, "1")
             _json_set(self.plugin.storage, CONF_ENABLE_TALKBACK, enabled)
             await self.plugin.refreshDevices()
+            await scrypted_sdk.deviceManager.onDeviceEvent(
+                self.nativeId, ScryptedInterface.Settings.value, None
+            )
+            return
+        if key == CONF_DOOR_AUDIO_GAIN_DB:
+            gain = clamp_door_audio_gain_db(value)
+            _json_set(self.plugin.storage, CONF_DOOR_AUDIO_GAIN_DB, gain)
+            await scrypted_sdk.deviceManager.onDeviceEvent(
+                self.nativeId, ScryptedInterface.Settings.value, None
+            )
+            return
+        if key == CONF_ENABLE_ECHO_CANCELLATION:
+            enabled = value in (True, "true", "True", 1, "1")
+            _json_set(self.plugin.storage, CONF_ENABLE_ECHO_CANCELLATION, enabled)
             await scrypted_sdk.deviceManager.onDeviceEvent(
                 self.nativeId, ScryptedInterface.Settings.value, None
             )
@@ -381,12 +317,41 @@ class C100XDoorbell(
     # --- Camera / snapshots -----------------------------------------------
 
     async def getPictureOptions(self):
-        return []
+        # Advertise 16:9 so HomeKit's Cameras tile does not stretch a portrait.
+        # canResize: we cover-crop to whatever HAP requests (portrait or landscape).
+        return [
+            {
+                "id": "default",
+                "name": "Citofono",
+                "picture": {"width": 1280, "height": 720},
+                "canResize": True,
+            }
+        ]
+
+    def _snapshot_coords(self) -> tuple[float, float]:
+        lat = _json_get(self.plugin.storage, CONF_LATITUDE, DEFAULT_LATITUDE)
+        lon = _json_get(self.plugin.storage, CONF_LONGITUDE, DEFAULT_LONGITUDE)
+        try:
+            return clamp_latitude(float(lat)), clamp_longitude(float(lon))
+        except (TypeError, ValueError):
+            return DEFAULT_LATITUDE, DEFAULT_LONGITUDE
 
     async def takePicture(self, options=None) -> MediaObject:
-        """Return a cached keyframe JPEG. Never places a monitoring call."""
+        """Return a recent keyframe JPEG, else day/night placeholder.
+
+        Never places a monitoring SIP call for snapshots. Picks portrait vs wide
+        by requested aspect, then cover-crops to the exact HAP size (no stretch).
+        Without a size, returns the wide placeholder (HomeKit tiles ≈16:9).
+        """
         self._warn_prebuffer()
-        jpeg = self._last_jpeg or PLACEHOLDER_JPEG
+        lat, lon = self._snapshot_coords()
+        jpeg = render_snapshot_jpeg(
+            jpeg=self._last_jpeg,
+            latitude=lat,
+            longitude=lon,
+            tz_name=DEFAULT_TIMEZONE,
+            options=options,
+        )
         return await scrypted_sdk.mediaManager.createMediaObject(jpeg, "image/jpeg")
 
     async def _cache_keyframe_jpeg(self, nal_payload: bytes) -> None:
@@ -431,12 +396,30 @@ class C100XDoorbell(
     # --- Video stream -----------------------------------------------------
 
     async def getVideoStreamOptions(self) -> list[ResponseMediaStreamOptions]:
+        # Prefer Opus (official Door Entry offer); Scrypted/HomeKit remux as needed.
+        # Only claim Opus from the gain path when the transcoder is actually running
+        # (setting alone can fall back to Speex passthrough if ffmpeg fails).
+        audio: dict[str, Any] = {"codec": "opus", "sampleRate": 48000}
+        if self._audio_gain and self._audio_gain.active:
+            audio = {"codec": "opus", "sampleRate": 48000}
+        elif self._media and self._media.active:
+            codec = self._media.selected_audio_codec()
+            if codec is not None:
+                name = codec.name.casefold()
+                if name == "opus":
+                    audio = {"codec": "opus", "sampleRate": codec.clock_rate}
+                elif name == "speex":
+                    audio = {"codec": "speex", "sampleRate": codec.clock_rate}
+                elif name == "pcmu":
+                    audio = {"codec": "pcm_mulaw", "sampleRate": 8000}
+                else:
+                    audio = {"codec": "pcm_alaw", "sampleRate": 8000}
         return [
             {
                 "id": "default",
                 "name": "Door Entry",
                 "video": {"codec": "h264"},
-                "audio": {"codec": "pcm_alaw", "sampleRate": 8000},
+                "audio": audio,
             }
         ]
 
@@ -472,82 +455,184 @@ class C100XDoorbell(
             with contextlib.suppress(Exception):
                 await self._rtsp.stop()
             self._rtsp = None
-        if self._media:
-            with contextlib.suppress(Exception):
-                await self._media.end()
-            self._media = None
+        await self._end_media()
 
-        media = SrtpMediaSession(
-            self.plugin.sip,
-            on_plain_rtp=self._on_plain_rtp,
-            on_keyframe=lambda nal: asyncio.create_task(self._cache_keyframe_jpeg(nal)),
-        )
-        self._media = media
-        self._logged_first_rtp = False
+        # One SrtpMediaSession per RTSP client, bound to the SipClient that is
+        # current *at connect time*. The server can outlive a SIP reconnect
+        # (settings save, supervisor), so it must never capture a SipClient.
+        session_media: dict[int, SrtpMediaSession | None] = {}
+        session_ready: dict[int, asyncio.Event] = {}
 
         async def on_connect(session: RtspSession) -> None:
-            # Do not block the RTSP handshake on the SIP INVITE. Scrypted's
-            # RtspClient times out OPTIONS after 10s, and a failed INVITE
-            # used to close the TCP socket before OPTIONS was answered.
+            # Do not block OPTIONS on SIP BYE or INVITE. Scrypted's RtspClient
+            # times out OPTIONS after 10s; awaiting talkback stop + BYE here
+            # (Bugbot) exceeded that on HomeKit reconnect during a live view.
             # DEVADDR must be the visible external-unit module id (HA 0.3.3),
             # not the gateway id — wrong DEVADDR yields SIP 486 Busy Here.
+            # Construct SrtpMediaSession only after previous BYE so we do not
+            # steal sip.on_call_end from the session that still owns _dialog.
+
+            sip = self.plugin.sip
+            if sip is None or not sip.registered:
+                self.print("Monitoring call failed: SIP is not registered yet")
+                await session.close()
+                return
+            ready = asyncio.Event()
+            session_media[id(session)] = None
+            session_ready[id(session)] = ready
+            self._logged_first_video = False
+            self._logged_first_audio = False
 
             async def _start_monitoring() -> None:
+                media: SrtpMediaSession | None = None
                 try:
-                    self.print("Starting monitoring call")
+                    # Previous call teardown (BYE) happens here — not before OPTIONS.
+                    async with self._media_lock:
+                        await self._end_media_unlocked()
+                        if session.closed:
+                            return
+                        ffmpeg_path: str | None = None
+                        with contextlib.suppress(Exception):
+                            ffmpeg_path = await scrypted_sdk.mediaManager.getFFmpegPath()
+                        media = SrtpMediaSession(
+                            sip,
+                            on_plain_rtp=self._on_plain_rtp,
+                            on_keyframe=lambda nal: asyncio.create_task(
+                                self._cache_keyframe_jpeg(nal)
+                            ),
+                            ffmpeg_path=ffmpeg_path,
+                            on_log=self.print,
+                        )
+                        session_media[id(session)] = media
+                        self._media = media
+                    talkback_on = self._talkback_enabled()
+                    self.print(
+                        "Starting monitoring call "
+                        f"(Intercom {'advertised' if talkback_on else 'OFF — enable talkback in settings'})"
+                    )
                     device_address = await self.plugin.monitoring_device_address()
-                    await media.start(device_address)
+                    deadline = asyncio.get_running_loop().time() + MONITOR_BUSY_RETRY_SECONDS
+                    while True:
+                        if session.closed or media is None:
+                            return
+                        try:
+                            session_neg = await media.start(device_address)
+                            break
+                        except MediaSessionError as err:
+                            # Ended underneath us (RTSP teardown during 486 retry).
+                            if "was ended" in str(err).casefold() or session.closed:
+                                return
+                            raise
+                        except SipError as err:
+                            # 486: the door already has a monitoring call (for example
+                            # Home Assistant's, which ends ~10 s after its last viewer).
+                            busy = "SIP status 486" in str(err)
+                            now = asyncio.get_running_loop().time()
+                            if not busy or session.closed or now >= deadline:
+                                raise
+                            self.print("Door busy (486); retrying monitoring call")
+                            await asyncio.sleep(MONITOR_BUSY_RETRY_INTERVAL)
+                            if session.closed:
+                                return
                     if session.closed:
                         await media.end()
                         return
-                    self.print("Monitoring call started")
+                    redacted = getattr(media, "last_answer_redacted", None)
+                    if redacted:
+                        self.print("Monitoring SDP answer (redacted):\n" + redacted)
+                    if session_neg.audio is None:
+                        reason = (
+                            getattr(media, "audio_reject_reason", None)
+                            or "answer omitted usable audio"
+                        )
+                        self.print(f"Monitoring call started (video only; {reason})")
+                    else:
+                        self.print(
+                            "Monitoring call started "
+                            f"(audio {format_negotiated_audio(session_neg)})"
+                        )
+                        await self._start_audio_gain(session_neg, ffmpeg_path)
                 except Exception as err:
                     self.print(f"Monitoring call failed: {_err_summary(err)}")
                     await session.close()
+                finally:
+                    ready.set()
 
             asyncio.create_task(_start_monitoring())
 
+        async def on_describe_ready(session: RtspSession) -> None:
+            ready = session_ready.get(id(session))
+            if ready is None:
+                return
+            # Wait through the 486 retry window so DESCRIBE sees negotiated
+            # codecs / gain Opus when possible. Still fall through with default
+            # Opus so a slow door cannot leave HomeKit without an audio track.
+            wait_s = MONITOR_BUSY_RETRY_SECONDS + 3.0
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(ready.wait(), timeout=wait_s)
+
         async def on_teardown(session: RtspSession) -> None:
-            if self._talkback:
-                with contextlib.suppress(Exception):
-                    await self._talkback.stop()
-            if self._media is media:
-                with contextlib.suppress(Exception):
-                    await media.end()
-                self._media = None
+            session_ready.pop(id(session), None)
+            media = session_media.pop(id(session), None)
+            if media is None:
+                return
+            async with self._media_lock:
+                if self._media is media:
+                    await self._end_media_unlocked()
+                else:
+                    with contextlib.suppress(Exception):
+                        await media.end()
 
         def sdp_builder(session: RtspSession) -> str:
-            negotiated: NegotiatedSession | None = media.negotiated
-            audio_pt = 8
-            audio_name = "PCMA"
-            if negotiated and negotiated.audio:
-                codec = negotiated.audio.codec({"pcma", "pcmu"})
-                if codec:
-                    audio_pt = codec.payload_type
-                    audio_name = codec.name.upper()
-            return "\r\n".join(
-                [
-                    "v=0",
-                    "o=- 0 0 IN IP4 127.0.0.1",
-                    "s=BTicino C100X",
-                    "c=IN IP4 127.0.0.1",
-                    "t=0 0",
-                    "m=video 0 RTP/AVP 96",
-                    "a=rtpmap:96 H264/90000",
-                    "a=fmtp:96 packetization-mode=1;profile-level-id=42e01f",
-                    "a=control:trackID=0",
-                    "a=sendonly",
-                    f"m=audio 0 RTP/AVP {audio_pt}",
-                    f"a=rtpmap:{audio_pt} {audio_name}/8000",
-                    "a=control:trackID=1",
-                    "a=sendonly",
-                    "",
-                ]
+            media = session_media.get(id(session))
+            negotiated: NegotiatedSession | None = (
+                media.negotiated if media is not None else None
             )
+            # Default to Opus (official offer preference) before negotiation.
+            # DESCRIBE waits for monitoring+gain start (on_describe_ready), so once
+            # ready the branch below matches what _on_plain_rtp actually sends.
+            audio_pt = 96
+            audio_rtpmap = "opus/48000/2"
+            audio_fmtp = "a=fmtp:96 useinbandfec=1"
+            if self._audio_gain and self._audio_gain.active:
+                # Gain transcoder emits Opus PT 96 (same as this default).
+                audio_pt = DoorAudioGainTranscoder.OUTPUT_PAYLOAD_TYPE
+                audio_rtpmap = DoorAudioGainTranscoder.OUTPUT_RTPMAP
+                audio_fmtp = f"a=fmtp:{audio_pt} useinbandfec=1"
+            elif negotiated and negotiated.audio:
+                codec = select_audio_codec(negotiated.audio)
+                if codec is not None:
+                    audio_pt = codec.payload_type
+                    channels = f"/{codec.channels}" if codec.channels != 1 else ""
+                    audio_rtpmap = f"{codec.name}/{codec.clock_rate}{channels}"
+                    audio_fmtp = (
+                        f"a=fmtp:{codec.payload_type} {codec.fmtp}"
+                        if codec.fmtp
+                        else ""
+                    )
+            lines = [
+                "v=0",
+                "o=- 0 0 IN IP4 127.0.0.1",
+                "s=BTicino C100X",
+                "c=IN IP4 127.0.0.1",
+                "t=0 0",
+                "m=video 0 RTP/AVP 96",
+                "a=rtpmap:96 H264/90000",
+                "a=fmtp:96 packetization-mode=1;profile-level-id=42e01f",
+                "a=control:trackID=0",
+                "a=sendonly",
+                f"m=audio 0 RTP/AVP {audio_pt}",
+                f"a=rtpmap:{audio_pt} {audio_rtpmap}",
+            ]
+            if audio_fmtp:
+                lines.append(audio_fmtp)
+            lines.extend(["a=control:trackID=1", "a=sendonly", ""])
+            return "\r\n".join(lines)
 
         server = RtspServer(
             on_connect=on_connect,
             on_teardown=on_teardown,
+            on_describe_ready=on_describe_ready,
             sdp_builder=sdp_builder,
             idle_seconds=MEDIA_IDLE_SECONDS,
             on_log=self.print,
@@ -556,34 +641,264 @@ class C100XDoorbell(
         url = await server.start()
         return url
 
+    async def _end_media(self) -> None:
+        """Stop talkback and end the current monitoring call, if any."""
+        async with self._media_lock:
+            await self._end_media_unlocked()
+
+    async def _end_media_unlocked(self) -> None:
+        """Caller must hold ``_media_lock``."""
+        talkback, self._talkback = self._talkback, None
+        if talkback:
+            with contextlib.suppress(Exception):
+                await talkback.stop()
+        gain, self._audio_gain = self._audio_gain, None
+        if gain:
+            with contextlib.suppress(Exception):
+                await gain.close()
+        echo, self._echo = self._echo, None
+        if echo:
+            with contextlib.suppress(Exception):
+                echo.close()
+        media, self._media = self._media, None
+        if media:
+            with contextlib.suppress(Exception):
+                await media.end()
+
+    async def _start_audio_gain(
+        self, session_neg: NegotiatedSession, ffmpeg_path: str | None
+    ) -> None:
+        """Start door→HomeKit audio processing (gain and/or AEC → Opus)."""
+        gain_db = self._door_audio_gain_db()
+        want_aec = self._echo_cancellation_enabled()
+        if session_neg.audio is None:
+            return
+        if gain_db <= 0 and not want_aec:
+            return
+        codec = select_audio_codec(session_neg.audio)
+        if codec is None:
+            return
+        previous, self._audio_gain = self._audio_gain, None
+        if previous:
+            with contextlib.suppress(Exception):
+                await previous.close()
+        echo, self._echo = self._echo, None
+        if echo:
+            with contextlib.suppress(Exception):
+                echo.close()
+
+        async def _forward_opus(packet: bytes) -> None:
+            if self._rtsp:
+                await self._rtsp.forward_rtp(packet, "audio")
+
+        if want_aec:
+            if not speexdsp_available():
+                self.print(
+                    "Echo cancellation requested but libspeexdsp is missing — "
+                    "falling back to gain-only / passthrough"
+                )
+                want_aec = False
+            else:
+                try:
+                    rate = int(getattr(codec, "clock_rate", 8000) or 8000)
+                    if str(codec.name).casefold() == "opus":
+                        rate = 48000
+                    self._echo = EchoCanceller(sample_rate=rate)
+                    transcoder: DoorAudioGainTranscoder | DoorAudioAecTranscoder = (
+                        DoorAudioAecTranscoder(
+                            gain_db=gain_db,
+                            echo=self._echo,
+                            on_opus_rtp=_forward_opus,
+                            ffmpeg_path=ffmpeg_path,
+                            on_log=self.print,
+                        )
+                    )
+                    await transcoder.start(codec)
+                except Exception as err:
+                    self.print(
+                        f"Door audio AEC failed; falling back: {type(err).__name__}"
+                    )
+                    if self._echo:
+                        with contextlib.suppress(Exception):
+                            self._echo.close()
+                        self._echo = None
+                    want_aec = False
+                else:
+                    if transcoder.active and self._media is not None and self._rtsp is not None:
+                        self._audio_gain = transcoder
+                        return
+                    with contextlib.suppress(Exception):
+                        await transcoder.close()
+                    if self._echo:
+                        with contextlib.suppress(Exception):
+                            self._echo.close()
+                        self._echo = None
+                    want_aec = False
+
+        if gain_db <= 0:
+            return
+        transcoder = DoorAudioGainTranscoder(
+            gain_db=gain_db,
+            on_opus_rtp=_forward_opus,
+            ffmpeg_path=ffmpeg_path,
+            on_log=self.print,
+        )
+        try:
+            await transcoder.start(codec)
+        except Exception as err:
+            self.print(f"Door audio gain failed; falling back to passthrough: {type(err).__name__}")
+            with contextlib.suppress(Exception):
+                await transcoder.close()
+            return
+        if not transcoder.active:
+            # Keep RTSP SDP on the negotiated codec (passthrough); do not claim Opus.
+            self.print(
+                f"Door audio gain +{gain_db} dB unavailable — "
+                "RTSP will passthrough negotiated audio"
+            )
+            return
+        # Teardown may have run while ffmpeg was starting — do not orphan it.
+        if self._media is None or self._rtsp is None:
+            with contextlib.suppress(Exception):
+                await transcoder.close()
+            return
+        self._audio_gain = transcoder
+
+    async def reset_media(self) -> None:
+        """Drop every media object tied to the current SipClient.
+
+        Called before the provider closes SIP. Stopping the RTSP server closes
+        any connected client so the next view asks for a fresh stream URL.
+        """
+        rtsp, self._rtsp = self._rtsp, None
+        if rtsp:
+            with contextlib.suppress(Exception):
+                await rtsp.stop()
+        await self._end_media()
+
     async def _on_plain_rtp(self, packet: bytes, kind: str) -> None:
-        if not getattr(self, "_logged_first_rtp", False):
-            self._logged_first_rtp = True
-            self.print(f"First RTP packet: {kind}")
+        if kind == "video" and not self._logged_first_video:
+            self._logged_first_video = True
+            self.print("First RTP packet: video")
+        elif kind == "audio" and not self._logged_first_audio:
+            self._logged_first_audio = True
+            self.print("First RTP packet: audio")
+        if kind == "audio" and self._audio_gain and self._audio_gain.active:
+            await self._audio_gain.feed_rtp(packet)
+            return
         if self._rtsp:
             await self._rtsp.forward_rtp(packet, kind)
 
     # --- Intercom / talkback ----------------------------------------------
 
     async def startIntercom(self, media: MediaObject) -> None:
+        self.print("startIntercom: entry")
         if not self._talkback_enabled():
+            self.print("startIntercom: refused — talkback disabled in settings")
             raise TalkbackError("Talkback is disabled; enable it in device settings")
         if not self._media or not self._media.active:
+            self.print("startIntercom: refused — no active viewing call")
             raise TalkbackError("Talkback requires an active viewing call")
-        ffmpeg_input = await scrypted_sdk.mediaManager.convertMediaObjectToJSON(
-            media, ScryptedMimeTypes.FFmpegInput.value
+        block = self._media.talkback_block_reason()
+        if block is not None:
+            message = f"Talkback unavailable: {block}"
+            self.print(f"startIntercom: refused — {message}")
+            raise TalkbackError(message)
+        codec = self._media.selected_audio_codec()
+        self.print(
+            "startIntercom: active call "
+            f"(codec={codec.name if codec else '?'}/"
+            f"{codec.clock_rate if codec else '?'})"
         )
+        try:
+            ffmpeg_input = await scrypted_sdk.mediaManager.convertMediaObjectToJSON(
+                media, ScryptedMimeTypes.FFmpegInput.value
+            )
+        except Exception as err:
+            self.print(f"startIntercom: FFmpegInput convert failed: {type(err).__name__}: {err}")
+            raise
         if not isinstance(ffmpeg_input, dict):
+            self.print("startIntercom: refused — expected FFmpegInput JSON")
             raise TalkbackError("Expected FFmpegInput JSON for talkback")
         ffmpeg = await scrypted_sdk.mediaManager.getFFmpegPath()
-        pipeline = TalkbackPipeline(self._media)
-        await pipeline.start(ffmpeg, ffmpeg_input)
+
+        def _on_uplink_pcm(pcm: bytes) -> None:
+            if self._echo is not None:
+                with contextlib.suppress(Exception):
+                    self._echo.playback(pcm)
+
+        pipeline = TalkbackPipeline(
+            self._media, on_log=self.print, on_pcm=_on_uplink_pcm
+        )
+        try:
+            await pipeline.start(ffmpeg, ffmpeg_input)
+        except MediaSessionError as err:
+            self.print(f"startIntercom: MediaSessionError: {err}")
+            raise TalkbackError(str(err)) from err
+        except TalkbackError as err:
+            self.print(f"startIntercom: TalkbackError: {err}")
+            raise
         self._talkback = pipeline
+        self.print("startIntercom: pipeline started")
 
     async def stopIntercom(self) -> None:
+        self.print("stopIntercom: entry")
         if self._talkback:
             await self._talkback.stop()
             self._talkback = None
+        else:
+            self.print("stopIntercom: no active pipeline")
+
+
+class C100XDoorLock(scrypted_sdk.ScryptedDeviceBase, Lock):
+    """Momentary apriporta exposed as a HomeKit Lock (always returns to Locked)."""
+
+    def __init__(self, nativeId: str, plugin: "C100XPlugin", lock_id: str, name: str) -> None:
+        super().__init__(nativeId=nativeId)
+        self.plugin = plugin
+        self.lock_id = lock_id
+        self.display_name = name
+        self.lockState = LockState.Locked.value
+        self._relock_task: asyncio.Task | None = None
+
+    async def lock(self) -> None:
+        """HomeKit lock — no-op; strike is momentary and state stays Locked."""
+        self.lockState = LockState.Locked.value
+        await scrypted_sdk.deviceManager.onDeviceEvent(
+            self.nativeId, ScryptedInterface.Lock.value, self.lockState
+        )
+
+    async def unlock(self) -> None:
+        """Release the door (SIP lock.setStatus) then auto-relock after a few seconds."""
+        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        self.print(f"Door unlock requested at {stamp} (lock_id={self.lock_id})")
+        sip = self.plugin.sip
+        gateway_id = self.plugin.gateway_id or _json_get(self.plugin.storage, CONF_GATEWAY_ID)
+        if sip is None or not sip.registered or not gateway_id:
+            self.print("Door unlock failed: SIP is not registered")
+            raise RuntimeError("Door release is unavailable while SIP is disconnected")
+        await sip.release_door(str(self.lock_id), str(gateway_id))
+        self.lockState = LockState.Unlocked.value
+        await scrypted_sdk.deviceManager.onDeviceEvent(
+            self.nativeId, ScryptedInterface.Lock.value, self.lockState
+        )
+        if self._relock_task and not self._relock_task.done():
+            self._relock_task.cancel()
+        self._relock_task = asyncio.create_task(self._auto_relock())
+
+    async def _auto_relock(self) -> None:
+        try:
+            await asyncio.sleep(DOOR_RELOCK_SECONDS)
+            self.lockState = LockState.Locked.value
+            await scrypted_sdk.deviceManager.onDeviceEvent(
+                self.nativeId, ScryptedInterface.Lock.value, self.lockState
+            )
+            self.print(
+                f"Door auto-relocked after {DOOR_RELOCK_SECONDS:.0f}s "
+                f"(lock_id={self.lock_id})"
+            )
+        except asyncio.CancelledError:
+            raise
 
 
 class C100XPlugin(
@@ -597,11 +912,15 @@ class C100XPlugin(
             "settings": "BTicino C100X",
         }
         self.device: C100XDoorbell | None = None
+        self.locks: dict[str, C100XDoorLock] = {}
         self.sip: SipClient | None = None
         self.gateway_id: str | None = None
         self.home_id: str | None = None
         # Official-topology visible EU module ids (buttonId order), like HA camera_ids.
         self.camera_ids: list[str] = []
+        # Official-topology visible Lock module ids (buttonId order), like HA lock_ids.
+        self.lock_ids: list[str] = []
+        self._lock_names: dict[str, str] = {}
         self._session: aiohttp.ClientSession | None = None
         self._auth: C100XAuth | None = None
         self._api: LegrandApi | None = None
@@ -640,19 +959,46 @@ class C100XPlugin(
         return path
 
     async def getDevice(self, nativeId: str) -> Any:
-        if nativeId != "doorbell":
-            return None
-        if self.device is None:
-            self.device = C100XDoorbell(nativeId, self)
-        return self.device
+        if nativeId == "doorbell":
+            if self.device is None:
+                self.device = C100XDoorbell(nativeId, self)
+            return self.device
+        if nativeId.startswith("lock-"):
+            lock_id = nativeId[len("lock-") :]
+            existing = self.locks.get(nativeId)
+            if existing is not None:
+                return existing
+            name = self._lock_names.get(lock_id) or "Apriporta"
+            lock = C100XDoorLock(nativeId, self, lock_id, name)
+            self.locks[nativeId] = lock
+            return lock
+        return None
 
     async def releaseDevice(self, id: str, nativeId: str) -> None:
         if nativeId == "doorbell":
             self.device = None
+        elif nativeId.startswith("lock-"):
+            self.locks.pop(nativeId, None)
+
+    def _expose_door_opener(self) -> bool:
+        return bool(_json_get(self.storage, CONF_EXPOSE_DOOR_OPENER, True))
+
+    def _door_audio_gain_db(self) -> int:
+        from c100x import const as _const
+
+        return clamp_door_audio_gain_db(
+            _json_get(
+                self.storage,
+                CONF_DOOR_AUDIO_GAIN_DB,
+                _const.DEFAULT_DOOR_AUDIO_GAIN_DB,
+            )
+        )
 
     # --- Settings ---------------------------------------------------------
 
     async def getSettings(self) -> list[Setting]:
+        from c100x import const as _const
+
         await self._maybe_refresh_pickers()
         plants = self._plants_cache
         gateways = self._gateways_cache
@@ -706,6 +1052,46 @@ class C100XPlugin(
                 "value": bool(_json_get(self.storage, CONF_ENABLE_TALKBACK, False)),
                 "description": "Advertise Intercom on the doorbell (HomeKit two-way audio).",
             },
+            {
+                "key": CONF_DOOR_AUDIO_GAIN_DB,
+                "title": "Door audio gain (dB)",
+                "type": "number",
+                "value": self._door_audio_gain_db(),
+                "description": (
+                    f"Boost quiet door→phone audio ({DOOR_AUDIO_GAIN_MIN_DB}–"
+                    f"{DOOR_AUDIO_GAIN_MAX_DB} dB, default +{_const.DEFAULT_DOOR_AUDIO_GAIN_DB}). "
+                    "Transcodes Speex/Opus/G.711 through ffmpeg volume+alimiter to Opus "
+                    "on the RTSP track when > 0. Applies on the next monitoring call."
+                ),
+            },
+            {
+                "key": CONF_EXPOSE_DOOR_OPENER,
+                "title": "Expose door opener to HomeKit",
+                "type": "boolean",
+                "value": self._expose_door_opener(),
+                "description": (
+                    "Publish each official-topology door release as a Lock device "
+                    "(unlock = apriporta). Off removes the Lock(s) from Scrypted/HomeKit."
+                ),
+            },
+            {
+                "key": CONF_LATITUDE,
+                "title": "Snapshot latitude",
+                "value": _json_get(self.storage, CONF_LATITUDE, DEFAULT_LATITUDE),
+                "description": (
+                    f"Used for day/night placeholder (local sunrise/sunset, no network). "
+                    f"Default {DEFAULT_LATITUDE} (Peraga, Vigonza)."
+                ),
+            },
+            {
+                "key": CONF_LONGITUDE,
+                "title": "Snapshot longitude",
+                "value": _json_get(self.storage, CONF_LONGITUDE, DEFAULT_LONGITUDE),
+                "description": (
+                    f"Used with latitude for day/night placeholder. "
+                    f"Default {DEFAULT_LONGITUDE} (Peraga, Vigonza, Europe/Rome)."
+                ),
+            },
         ]
 
     async def putSetting(self, key: str, value: Any) -> None:
@@ -720,7 +1106,48 @@ class C100XPlugin(
             value = value.rsplit("(", 1)[-1].rstrip(")").strip()
 
         if key == CONF_ENABLE_TALKBACK:
-            value = value in (True, "true", "True", 1, "1")
+            # Only toggles the Intercom interface; never tear down SIP for it.
+            _json_set(self.storage, key, value in (True, "true", "True", 1, "1"))
+            await self.refreshDevices()
+            await scrypted_sdk.deviceManager.onDeviceEvent(
+                None, ScryptedInterface.Settings.value, None
+            )
+            return
+
+        if key == CONF_EXPOSE_DOOR_OPENER:
+            _json_set(self.storage, key, value in (True, "true", "True", 1, "1"))
+            await self.refreshDevices()
+            await scrypted_sdk.deviceManager.onDeviceEvent(
+                None, ScryptedInterface.Settings.value, None
+            )
+            return
+
+        if key == CONF_DOOR_AUDIO_GAIN_DB:
+            _json_set(self.storage, key, clamp_door_audio_gain_db(value))
+            await scrypted_sdk.deviceManager.onDeviceEvent(
+                None, ScryptedInterface.Settings.value, None
+            )
+            return
+
+        if key == CONF_LATITUDE:
+            try:
+                _json_set(self.storage, key, clamp_latitude(float(value)))
+            except (TypeError, ValueError):
+                _json_set(self.storage, key, DEFAULT_LATITUDE)
+            await scrypted_sdk.deviceManager.onDeviceEvent(
+                None, ScryptedInterface.Settings.value, None
+            )
+            return
+
+        if key == CONF_LONGITUDE:
+            try:
+                _json_set(self.storage, key, clamp_longitude(float(value)))
+            except (TypeError, ValueError):
+                _json_set(self.storage, key, DEFAULT_LONGITUDE)
+            await scrypted_sdk.deviceManager.onDeviceEvent(
+                None, ScryptedInterface.Settings.value, None
+            )
+            return
 
         _json_set(self.storage, key, value)
 
@@ -837,14 +1264,21 @@ class C100XPlugin(
         self._gateways_cache = gateways or modules
 
     async def _refresh_camera_ids(self) -> None:
-        """Load visible external-unit ids from official topology (HA camera_ids)."""
+        """Load visible external-unit and lock ids from official topology."""
         if not self._api or not self.home_id:
             self.camera_ids = []
+            self.lock_ids = []
+            self._lock_names = {}
             return
         modules = await self._api.modules(self.home_id)
         self.camera_ids = [
             str(module["id"]) for module in visible_external_units(modules)
         ]
+        locks = visible_lock_modules(modules)
+        self.lock_ids = [str(module["id"]) for module in locks]
+        self._lock_names = {
+            str(module["id"]): str(module.get("name") or "Apriporta") for module in locks
+        }
 
     async def monitoring_device_address(self) -> str:
         """Return the EU module id for SDP ``a=DEVADDR:`` on a monitoring INVITE.
@@ -1013,10 +1447,8 @@ class C100XPlugin(
             self._supervise_task.cancel()
             await asyncio.gather(self._supervise_task, return_exceptions=True)
             self._supervise_task = None
-        if self.device and self.device._media:
-            with contextlib.suppress(Exception):
-                await self.device._media.end()
-            self.device._media = None
+        if self.device:
+            await self.device.reset_media()
         if self.sip:
             with contextlib.suppress(Exception):
                 await self.sip.close()
@@ -1036,19 +1468,52 @@ class C100XPlugin(
         ]
         if talkback:
             interfaces.append(ScryptedInterface.Intercom.value)
-        device = {
-            "nativeId": "doorbell",
-            "name": "BTicino C100X",
-            "type": ScryptedDeviceType.Doorbell.value,
-            "interfaces": interfaces,
-            "info": {
-                "manufacturer": "BTicino",
-                "model": "Classe 100X",
-            },
-        }
-        await scrypted_sdk.deviceManager.onDevicesChanged({"devices": [device]})
-        # Ensure instance exists.
+        devices: list[dict[str, Any]] = [
+            {
+                "nativeId": "doorbell",
+                "name": "BTicino C100X",
+                "type": ScryptedDeviceType.Doorbell.value,
+                "interfaces": interfaces,
+                "info": {
+                    "manufacturer": "BTicino",
+                    "model": "Classe 100X",
+                },
+            }
+        ]
+        lock_ids = getattr(self, "lock_ids", None) or []
+        lock_names = getattr(self, "_lock_names", None) or {}
+        locks = getattr(self, "locks", None)
+        if locks is None:
+            self.locks = {}
+            locks = self.locks
+        if self._expose_door_opener():
+            if not lock_ids and getattr(self, "_api", None) and getattr(self, "home_id", None):
+                with contextlib.suppress(Exception):
+                    await self._refresh_camera_ids()
+                lock_ids = getattr(self, "lock_ids", None) or []
+                lock_names = getattr(self, "_lock_names", None) or {}
+            for lock_id in lock_ids:
+                name = lock_names.get(lock_id) or "Apriporta"
+                devices.append(
+                    {
+                        "nativeId": f"lock-{lock_id}",
+                        "name": name,
+                        "type": ScryptedDeviceType.Lock.value,
+                        "interfaces": [ScryptedInterface.Lock.value],
+                        "info": {
+                            "manufacturer": "BTicino",
+                            "model": "Classe 100X Door",
+                        },
+                    }
+                )
+        await scrypted_sdk.deviceManager.onDevicesChanged({"devices": devices})
+        # Ensure instances exist for advertised devices.
         await self.getDevice("doorbell")
+        if self._expose_door_opener():
+            for lock_id in lock_ids:
+                await self.getDevice(f"lock-{lock_id}")
+        else:
+            locks.clear()
 
 
 

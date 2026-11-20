@@ -20,9 +20,27 @@ from typing import Any
 
 import pylibsrtp
 
+from .audio_codec import (
+    OpusEncoder,
+    SpeexFfmpegEncoder,
+    TalkbackFormat,
+    resolve_ffmpeg,
+    speex_silence_frame,
+    talkback_format_for,
+)
+from .const import RTP_COUNTER_LOG_INTERVAL, RTP_COUNTER_LOG_WINDOW
 from .g711 import encode_g711, silence_frame
-from .sdp import Codec, NegotiatedSession, build_monitoring_offer, parse_answer
-from .sip import SipClient
+from .sdp import (
+    Codec,
+    NegotiatedSession,
+    build_monitoring_offer,
+    explain_answer_audio,
+    format_negotiated_audio,
+    parse_answer,
+    redact_sdp,
+    select_audio_codec,
+)
+from .sip import SipClient, SipError
 from .stun import StunError, binding_request, discover_mappings, is_stun, reply_binding
 
 _LOGGER = logging.getLogger(__name__)
@@ -180,6 +198,12 @@ class _MediaRtpProtocol(asyncio.DatagramProtocol):
         self._inbound: pylibsrtp.Session | None = None
         self._outbound: pylibsrtp.Session | None = None
         self._codec: Codec | None = None
+        self._fmt: TalkbackFormat | None = None
+        self._opus: OpusEncoder | None = None
+        self._speex: SpeexFfmpegEncoder | None = None
+        self._speex_pending = False
+        self._speex_chain: asyncio.Task[None] | None = None
+        self._speex_epoch = 0
         self._remote: tuple[str, int] | None = None
         self._talkback = False
         self._pcm = bytearray()
@@ -188,6 +212,57 @@ class _MediaRtpProtocol(asyncio.DatagramProtocol):
         self._ssrc = secrets.randbelow(2**32)
         self._first_packet = True
         self._got_media = False
+        # Monotonic time of last uplink TX (silence or mic). Used to gap-fill
+        # silence during talkback so the door never sees a TX stall.
+        self._last_tx_mono = 0.0
+        # When mic PCM was last accepted (before Speex async encode finishes).
+        self._mic_queued_mono = 0.0
+        self.rx_packets = 0
+        self.rx_bytes = 0
+        self.tx_packets = 0
+        self.tx_bytes = 0
+
+    @property
+    def last_tx_mono(self) -> float:
+        return self._last_tx_mono
+
+    def tx_gap_seconds(self, now: float | None = None) -> float:
+        """Seconds since the last uplink packet (silence or mic)."""
+        if self._last_tx_mono <= 0.0:
+            return 999.0
+        return (time.monotonic() if now is None else now) - self._last_tx_mono
+
+    def needs_uplink_gap_fill(
+        self,
+        *,
+        gap_fill_after: float = 0.018,
+        encode_budget: float = 0.1,
+        now: float | None = None,
+    ) -> bool:
+        """Return True when keepalive should inject silence this tick.
+
+        Speex mic frames only update ``_last_tx_mono`` after async encode, so a
+        naive 18 ms TX-gap check would inject canned silence into healthy
+        talkback. Hold off briefly while PCM was just queued or Speex encode is
+        in flight — but cap that hold by **TX stall** (``encode_budget``), not
+        mic-accept age. Otherwise continuous HomeKit PCM would refresh
+        ``_mic_queued_mono`` forever and a stuck Speex chain would freeze TX.
+        """
+        now = time.monotonic() if now is None else now
+        tx_gap = self.tx_gap_seconds(now)
+        if tx_gap < gap_fill_after:
+            return False
+        if not self._talkback:
+            return True
+        mic_age = (
+            now - self._mic_queued_mono if self._mic_queued_mono > 0.0 else 999.0
+        )
+        inflight = self._speex_chain is not None and not self._speex_chain.done()
+        # Healthy Speex path: TX may lag encode by tens of ms — don't inject yet.
+        if tx_gap < encode_budget and (inflight or mic_age < gap_fill_after):
+            return False
+        # TX stalled beyond encode budget (or no mic activity) → force silence.
+        return True
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
         self.transport = transport  # type: ignore[assignment]
@@ -209,11 +284,20 @@ class _MediaRtpProtocol(asyncio.DatagramProtocol):
         media = session.audio
         if media is None or media.crypto is None:
             return
-        codec = media.codec({"pcma", "pcmu"})
+        codec = select_audio_codec(media)
         if codec is None:
             raise MediaSessionError("No supported negotiated audio codec")
         self._codec = codec
+        self._fmt = talkback_format_for(codec)
         self._remote = (media.connection, media.port)
+        name = codec.name.casefold()
+        if name == "opus":
+            try:
+                self._opus = OpusEncoder(sample_rate=codec.clock_rate or 48000)
+            except Exception as err:  # noqa: BLE001 — missing native lib
+                raise MediaSessionError(f"Opus encoder unavailable: {err}") from err
+        elif name == "speex":
+            self._speex_pending = True
         inbound_policy = pylibsrtp.Policy(
             key=media.crypto.key,
             ssrc_type=pylibsrtp.Policy.SSRC_ANY_INBOUND,
@@ -226,6 +310,39 @@ class _MediaRtpProtocol(asyncio.DatagramProtocol):
         )
         self._inbound = pylibsrtp.Session(inbound_policy)
         self._outbound = pylibsrtp.Session(outbound_policy)
+
+    async def prepare_encoders(self, ffmpeg_path: str | None = None) -> None:
+        """Start Speex ffmpeg encoder when that codec was negotiated."""
+        if not getattr(self, "_speex_pending", False) or self._codec is None:
+            return
+        path = resolve_ffmpeg(ffmpeg_path)
+        if not path:
+            _LOGGER.error(
+                "Speex negotiated but ffmpeg was not found; talkback/silence uplink disabled"
+            )
+            self._speex_pending = False
+            return
+        encoder = SpeexFfmpegEncoder(
+            ffmpeg_path=path,
+            sample_rate=self._codec.clock_rate or 8000,
+            payload_type=self._codec.payload_type,
+        )
+        # Assign before await so protocol close()/teardown during warm-up sees it.
+        self._speex = encoder
+        try:
+            await encoder.start()
+        except Exception as err:  # noqa: BLE001
+            self._speex = None
+            with contextlib.suppress(Exception):
+                await encoder.close()
+            _LOGGER.error(
+                "Speex negotiated but ffmpeg libspeex encoder failed (%s); "
+                "talkback/silence uplink disabled",
+                err,
+            )
+            self._speex_pending = False
+            return
+        self._speex_pending = False
 
     def prime_remote(self) -> None:
         if self.transport is not None and self._remote is not None:
@@ -240,39 +357,120 @@ class _MediaRtpProtocol(asyncio.DatagramProtocol):
             plain = self._inbound.unprotect(data)
         except pylibsrtp.Error:
             return
+        self.rx_packets += 1
+        self.rx_bytes += len(plain)
         if not self._got_media:
             self._got_media = True
             if self.on_first_media:
                 self.on_first_media()
+        # Opus / Speex / G.711: forward decrypted RTP straight to RTSP.
         self.on_plain_rtp(plain, self.kind)
 
     def set_talkback(self, enabled: bool) -> None:
         self._talkback = enabled
         if not enabled:
             self._pcm.clear()
+            self._mic_queued_mono = 0.0
+            self._speex_epoch += 1
+            chain, self._speex_chain = self._speex_chain, None
+            if chain is not None:
+                chain.cancel()
 
-    def send_silence(self) -> None:
-        if self._talkback or self._codec is None:
+    async def send_silence(self, *, force: bool = False) -> None:
+        """Send one silence frame.
+
+        When ``force`` is False (legacy), silence is suppressed while talkback
+        is enabled. Prefer the session keepalive's gap-fill path (``force=True``)
+        so uplink never stalls waiting for mic frames.
+        """
+        if self._codec is None:
             return
+        if self._talkback and not force:
+            return
+        name = self._codec.name.casefold()
         try:
-            payload = silence_frame(self._codec.name)
-            self._send_g711_payload(payload, samples=160)
-        except (ValueError, pylibsrtp.Error):
+            if name in {"pcma", "pcmu"}:
+                payload = silence_frame(self._codec.name)
+                self._send_payload(payload, samples=160)
+            elif name == "opus" and self._opus is not None:
+                self._send_payload(self._opus.encode_silence(), samples=self._opus.frame_samples)
+            elif name == "speex":
+                # Prefer canned 8 kHz Speex silence (door opens downlink once it
+                # hears upstream). Fall back to ffmpeg encoder when available.
+                samples = self._fmt.frame_samples if self._fmt else 160
+                payload = speex_silence_frame(self._codec.clock_rate or 8000)
+                if payload is None and self._speex is not None:
+                    payload = await self._speex.encode_silence()
+                if payload and (force or not self._talkback):
+                    self._send_payload(payload, samples=samples)
+        except (ValueError, pylibsrtp.Error, OSError):
             return
 
     def send_pcm(self, pcm: bytes) -> None:
-        if not self._talkback or self._codec is None:
+        """Queue PCM for talkback; Speex frames are serialized on one task chain."""
+        if not self._talkback or self._codec is None or self._fmt is None:
             return
+        # Mark mic activity before encode so gap-fill does not inject silence
+        # while Speex ffmpeg is still producing the RTP payload.
+        self._mic_queued_mono = time.monotonic()
         self._pcm.extend(pcm)
-        packet_bytes = self._codec.clock_rate // 50 * 2  # 20 ms mono s16
-        while len(self._pcm) >= packet_bytes:
-            chunk = bytes(self._pcm[:packet_bytes])
-            del self._pcm[:packet_bytes]
-            samples = len(chunk) // 2
-            payload = encode_g711(chunk, self._codec.name)
-            self._send_g711_payload(payload, samples=samples)
+        name = self._codec.name.casefold()
+        frame_bytes = self._fmt.frame_bytes
+        # Bound latency: keep at most ~100 ms of PCM if Speex encode is slow.
+        max_buffered = frame_bytes * 5
+        if len(self._pcm) > max_buffered:
+            del self._pcm[:-max_buffered]
+        while len(self._pcm) >= frame_bytes:
+            chunk = bytes(self._pcm[:frame_bytes])
+            del self._pcm[:frame_bytes]
+            if name in {"pcma", "pcmu"}:
+                samples = len(chunk) // 2
+                payload = encode_g711(chunk, self._codec.name)
+                self._send_payload(payload, samples=samples)
+            elif name == "opus" and self._opus is not None:
+                try:
+                    payload = self._opus.encode(chunk)
+                except Exception:  # noqa: BLE001
+                    continue
+                self._send_payload(payload, samples=self._opus.frame_samples)
+            elif name == "speex":
+                prev = self._speex_chain
+                epoch = self._speex_epoch
 
-    def _send_g711_payload(self, payload: bytes, *, samples: int) -> None:
+                async def _run(
+                    frame: bytes = chunk,
+                    prior: asyncio.Task[None] | None = prev,
+                    expected: int = epoch,
+                ) -> None:
+                    if prior is not None:
+                        # Do not swallow CancelledError from *this* task; only
+                        # ignore a cancelled/failed predecessor so the chain
+                        # can stop when talkback is disabled.
+                        with contextlib.suppress(Exception):
+                            await prior
+                    if not self._talkback or self._speex_epoch != expected:
+                        return
+                    await self._send_speex_pcm(frame, expected)
+
+                self._speex_chain = asyncio.create_task(_run())
+
+    async def _send_speex_pcm(self, chunk: bytes, epoch: int) -> None:
+        if (
+            not self._talkback
+            or self._speex_epoch != epoch
+            or self._speex is None
+            or self._fmt is None
+        ):
+            return
+        payload = await self._speex.encode(chunk)
+        if (
+            payload
+            and self._talkback
+            and self._speex_epoch == epoch
+        ):
+            self._send_payload(payload, samples=self._fmt.frame_samples)
+
+    def _send_payload(self, payload: bytes, *, samples: int) -> None:
         if (
             self._codec is None
             or self._outbound is None
@@ -290,6 +488,9 @@ class _MediaRtpProtocol(asyncio.DatagramProtocol):
         )
         protected = self._outbound.protect(packet)
         self.transport.sendto(protected, self._remote)
+        self.tx_packets += 1
+        self.tx_bytes += len(protected)
+        self._last_tx_mono = time.monotonic()
         self._first_packet = False
         self._sequence = (self._sequence + 1) & 0xFFFF
         self._timestamp = (self._timestamp + samples) & 0xFFFFFFFF
@@ -298,8 +499,19 @@ class _MediaRtpProtocol(asyncio.DatagramProtocol):
     def codec(self) -> Codec | None:
         return self._codec
 
+    @property
+    def talkback_format(self) -> TalkbackFormat | None:
+        return self._fmt
+
     def close(self) -> None:
         self.set_talkback(False)
+        speex, self._speex = self._speex, None
+        if speex is not None:
+            with contextlib.suppress(RuntimeError):
+                loop = asyncio.get_running_loop()
+                loop.create_task(speex.close())
+        self._opus = None
+        self._fmt = None
         if self.transport:
             self.transport.close()
             self.transport = None
@@ -313,14 +525,21 @@ class SrtpMediaSession:
         sip: SipClient,
         on_plain_rtp: RtpCallback | None = None,
         on_keyframe: Callable[[bytes], None] | None = None,
+        ffmpeg_path: str | None = None,
+        on_log: Callable[[str], None] | None = None,
     ) -> None:
         self.sip = sip
         self.on_plain_rtp = on_plain_rtp
         self.on_keyframe = on_keyframe
+        self.ffmpeg_path = ffmpeg_path
+        self.on_log = on_log
         self.negotiated: NegotiatedSession | None = None
         self.audio: _MediaRtpProtocol | None = None
         self.video: _MediaRtpProtocol | None = None
         self.talkback_enabled = False
+        # Set when the answer omitted usable audio (port 0 / missing section).
+        self.audio_reject_reason: str | None = None
+        self.last_answer_redacted: str | None = None
         self._audio_rtcp: asyncio.DatagramTransport | None = None
         self._video_rtcp: asyncio.DatagramTransport | None = None
         self._primer: asyncio.Task[None] | None = None
@@ -329,16 +548,29 @@ class SrtpMediaSession:
         self._first_video = asyncio.Event()
         self._last_packet = 0.0
         self._ending = False
+        # Sticky: set by end()/remote_ended so a finished teardown cannot be
+        # mistaken for a still-live session (``_ending`` clears in finally).
+        self._discarded = False
+        self._teardown_done = asyncio.Event()
+        self._teardown_done.set()
         self._last_keyframe: bytes | None = None
-        self.sip.on_call_end = self.remote_ended
+        # Do not claim sip.on_call_end in __init__: a reconnect may construct this
+        # object before the previous session's BYE finishes. start() installs it.
 
     @property
     def active(self) -> bool:
-        return self.negotiated is not None and not self._ending
+        return self.negotiated is not None and not self._ending and not self._discarded
 
     @property
     def last_keyframe(self) -> bytes | None:
         return self._last_keyframe
+
+    def _claim_call_end_callback(self) -> None:
+        self.sip.on_call_end = self.remote_ended
+
+    def _release_call_end_callback(self) -> None:
+        if self.sip.on_call_end == self.remote_ended:
+            self.sip.on_call_end = None
 
     def _dispatch_rtp(self, packet: bytes, kind: str) -> None:
         self._last_packet = time.monotonic()
@@ -360,77 +592,134 @@ class SrtpMediaSession:
             if asyncio.iscoroutine(result):
                 asyncio.create_task(result)
 
+    def _ensure_not_discarded(self) -> None:
+        if self._discarded or self.audio is None or self.video is None:
+            raise MediaSessionError("Media session was ended")
+
     async def start(self, device_address: str) -> NegotiatedSession:
+        # Never clobber an in-flight teardown's event (Bugbot): waiters must
+        # observe the same Event that _teardown will set.
+        if self._ending:
+            await self._teardown_done.wait()
+        if self._discarded:
+            raise MediaSessionError("Media session was ended")
         if self.negotiated:
             raise MediaSessionError("A media session is already active")
-        self._ending = False
         self.talkback_enabled = False
+        self.audio_reject_reason = None
+        self.last_answer_redacted = None
+        self._claim_call_end_callback()
+        owned_dialog = None
         audio_sockets, audio_port = await asyncio.to_thread(reserve_even_pair)
         video_sockets, video_port = await asyncio.to_thread(reserve_even_pair)
-        try:
-            mappings = await asyncio.to_thread(
-                discover_mappings, audio_sockets + video_sockets
-            )
-        except StunError as err:
-            for reserved in audio_sockets + video_sockets:
-                reserved.close()
-            raise MediaSessionError(str(err)) from err
-        except Exception:
-            for reserved in audio_sockets + video_sockets:
-                reserved.close()
-            raise
-        public_addresses = {item[0] for item in mappings}
-        if len(public_addresses) != 1:
-            for reserved in audio_sockets + video_sockets:
-                reserved.close()
-            raise MediaSessionError("STUN returned inconsistent public media addresses")
-        address = public_addresses.pop()
-        loop = asyncio.get_running_loop()
-        try:
-            _audio_transport, audio_proto = await loop.create_datagram_endpoint(
-                lambda: _MediaRtpProtocol(
-                    "audio",
-                    self._dispatch_rtp,
-                    on_first_media=lambda: _LOGGER.debug("inbound audio RTP"),
-                ),
-                sock=audio_sockets[0],
-            )
-            audio_rtcp, _ = await loop.create_datagram_endpoint(
-                _StunResponderProtocol, sock=audio_sockets[1]
-            )
-            _video_transport, video_proto = await loop.create_datagram_endpoint(
-                lambda: _MediaRtpProtocol("video", self._dispatch_rtp),
-                sock=video_sockets[0],
-            )
-            video_rtcp, _ = await loop.create_datagram_endpoint(
-                _StunResponderProtocol, sock=video_sockets[1]
-            )
-        except OSError as err:
+
+        def _close_reserved() -> None:
             for reserved in audio_sockets + video_sockets:
                 with contextlib.suppress(OSError):
                     reserved.close()
-            raise MediaSessionError("RTP socket activation failed") from err
 
-        self.audio = audio_proto
-        self.video = video_proto
-        self._audio_rtcp = audio_rtcp
-        self._video_rtcp = video_rtcp
-        offer = build_monitoring_offer(
-            address=address,
-            audio_port=audio_port,
-            video_port=video_port,
-            device_address=device_address,
-            advertised_audio_port=mappings[0][1],
-            advertised_audio_rtcp_port=mappings[1][1],
-            advertised_video_port=mappings[2][1],
-            advertised_video_rtcp_port=mappings[3][1],
-        )
         try:
-            answer = await self.sip.start_monitoring(offer.sdp)
+            if self._discarded:
+                _close_reserved()
+                raise MediaSessionError("Media session was ended")
+            try:
+                mappings = await asyncio.to_thread(
+                    discover_mappings, audio_sockets + video_sockets
+                )
+            except StunError as err:
+                _close_reserved()
+                raise MediaSessionError(str(err)) from err
+            except Exception:
+                _close_reserved()
+                raise
+            if self._discarded:
+                _close_reserved()
+                raise MediaSessionError("Media session was ended")
+            public_addresses = {item[0] for item in mappings}
+            if len(public_addresses) != 1:
+                _close_reserved()
+                raise MediaSessionError("STUN returned inconsistent public media addresses")
+            address = public_addresses.pop()
+            loop = asyncio.get_running_loop()
+            try:
+                _audio_transport, audio_proto = await loop.create_datagram_endpoint(
+                    lambda: _MediaRtpProtocol(
+                        "audio",
+                        self._dispatch_rtp,
+                        on_first_media=lambda: _LOGGER.debug("inbound audio RTP"),
+                    ),
+                    sock=audio_sockets[0],
+                )
+                audio_rtcp, _ = await loop.create_datagram_endpoint(
+                    _StunResponderProtocol, sock=audio_sockets[1]
+                )
+                _video_transport, video_proto = await loop.create_datagram_endpoint(
+                    lambda: _MediaRtpProtocol("video", self._dispatch_rtp),
+                    sock=video_sockets[0],
+                )
+                video_rtcp, _ = await loop.create_datagram_endpoint(
+                    _StunResponderProtocol, sock=video_sockets[1]
+                )
+            except OSError as err:
+                _close_reserved()
+                raise MediaSessionError("RTP socket activation failed") from err
+
+            if self._discarded:
+                audio_proto.close()
+                video_proto.close()
+                audio_rtcp.close()
+                video_rtcp.close()
+                raise MediaSessionError("Media session was ended")
+
+            self.audio = audio_proto
+            self.video = video_proto
+            self._audio_rtcp = audio_rtcp
+            self._video_rtcp = video_rtcp
+            offer = build_monitoring_offer(
+                address=address,
+                audio_port=audio_port,
+                video_port=video_port,
+                device_address=device_address,
+                advertised_audio_port=mappings[0][1],
+                advertised_audio_rtcp_port=mappings[1][1],
+                advertised_video_port=mappings[2][1],
+                advertised_video_rtcp_port=mappings[3][1],
+            )
+            # Abort before INVITE so a finished end() during STUN/sockets does
+            # not occupy the door's single monitoring slot.
+            self._ensure_not_discarded()
+            try:
+                answer = await self.sip.start_monitoring(offer.sdp)
+            except SipError as err:
+                # Only BYE a dialog this attempt installed (ACK-after-200).
+                # Never snapshot sip._dialog — a replacement may already own it.
+                owned_dialog = err.dialog
+                raise
+            owned_dialog = self.sip._dialog
+            # ``_ending`` clears when teardown finishes, so also require live
+            # sockets / not-discarded (HomeKit reconnect during INVITE/486).
+            self._ensure_not_discarded()
+            # Field diagnosis: keep the door's answer with SDES keys stripped.
+            self.last_answer_redacted = redact_sdp(answer).rstrip()
+            _LOGGER.info("Monitoring SDP answer (redacted):\n%s", self.last_answer_redacted)
+            audio_explain = explain_answer_audio(answer)
             session = parse_answer(answer, offer)
+            self._ensure_not_discarded()
             self.negotiated = session
+            if session.audio is None:
+                self.audio_reject_reason = audio_explain
+                _LOGGER.warning(
+                    "Monitoring answer negotiated video only; audio not usable (%s)",
+                    audio_explain,
+                )
+            else:
+                self.audio_reject_reason = None
+                _LOGGER.info(
+                    "Monitoring negotiated audio: %s", format_negotiated_audio(session)
+                )
             self.audio.configure_audio(session)
             self.video.configure_video(session)
+            await self.audio.prepare_encoders(self.ffmpeg_path)
             self.audio.prime_remote()
             self.video.prime_remote()
             if session.audio:
@@ -445,27 +734,76 @@ class SrtpMediaSession:
             self._last_packet = time.monotonic()
             self._primer = asyncio.create_task(self._prime_relay())
             self._keepalive = asyncio.create_task(self._audio_keepalive())
+            self._idle = asyncio.create_task(self._rtp_counter_log())
+            if session.audio:
+                codec = select_audio_codec(session.audio)
+                msg = (
+                    "Uplink silence keepalive started "
+                    f"({codec.name}/{codec.clock_rate if codec else '?'}) — "
+                    "door needs TX audio before it opens downlink"
+                )
+                _LOGGER.info("%s", msg)
+                if self.on_log:
+                    with contextlib.suppress(Exception):
+                        self.on_log(msg)
             return session
         except Exception:
-            await self._teardown(send_bye=True)
+            # Failed-start cleanup must not set ``_discarded`` — 486 retries
+            # call start() again on the same object. BYE only the dialog this
+            # start() created so a newer HomeKit session's dialog survives.
+            await self._teardown(send_bye=False, discard=False)
+            if owned_dialog is not None:
+                with contextlib.suppress(Exception):
+                    await self.sip.end_monitoring(owned_dialog)
             raise
 
     async def end(self) -> None:
-        await self._teardown(send_bye=True)
+        await self._teardown(send_bye=True, discard=True)
 
     async def remote_ended(self) -> None:
-        await self._teardown(send_bye=False)
+        await self._teardown(send_bye=False, discard=True)
+
+    def talkback_block_reason(self) -> str | None:
+        """Return why talkback cannot start, or None when it can."""
+        if self.negotiated is None or self._ending or self._discarded:
+            return "no active monitoring call"
+        if self.negotiated.audio is None:
+            detail = self.audio_reject_reason or "answer omitted usable audio"
+            return f"outdoor unit did not negotiate audio ({detail})"
+        if self.audio is None:
+            return "audio RTP socket is not configured"
+        if self.negotiated.audio.direction not in {"sendrecv", "recvonly"}:
+            return (
+                "outdoor unit audio direction is "
+                f"{self.negotiated.audio.direction} (need sendrecv or recvonly)"
+            )
+        if select_audio_codec(self.negotiated.audio) is None:
+            return "outdoor unit selected an unsupported audio codec"
+        if (
+            self.audio
+            and self.audio.codec
+            and self.audio.codec.name.casefold() == "speex"
+            and self.audio._speex is None
+        ):
+            return "Speex negotiated but ffmpeg libspeex encoder is unavailable"
+        return None
+
+    def talkback_format(self) -> TalkbackFormat | None:
+        if self.audio and self.audio.talkback_format:
+            return self.audio.talkback_format
+        codec = select_audio_codec(self.negotiated.audio) if self.negotiated else None
+        return talkback_format_for(codec) if codec else None
+
+    def selected_audio_codec(self) -> Codec | None:
+        if not self.negotiated:
+            return None
+        return select_audio_codec(self.negotiated.audio)
 
     async def set_talkback(self, enabled: bool) -> None:
-        if enabled and (self.negotiated is None or self.negotiated.audio is None or self.audio is None):
-            raise MediaSessionError("Talkback requires an active negotiated call")
-        if (
-            enabled
-            and self.negotiated
-            and self.negotiated.audio
-            and self.negotiated.audio.direction not in {"sendrecv", "recvonly"}
-        ):
-            raise MediaSessionError("The outdoor unit did not negotiate microphone reception")
+        if enabled:
+            reason = self.talkback_block_reason()
+            if reason is not None:
+                raise MediaSessionError(f"Talkback unavailable: {reason}")
         self.talkback_enabled = enabled
         if self.audio:
             self.audio.set_talkback(enabled)
@@ -500,25 +838,69 @@ class SrtpMediaSession:
             raise
 
     async def _audio_keepalive(self) -> None:
+        """Maintain ~50 pps uplink: silence, or gap-fill when mic frames lag.
+
+        Field regression (0.1.14–0.1.16): ``set_talkback(True)`` stopped silence
+        before the HomeKit return-audio ffmpeg pipeline produced PCM, so TX
+        stalled (~5 s at fixed tx_pkts) and the door never heard the phone.
+
+        Gap-fill uses ``needs_uplink_gap_fill`` so in-flight Speex encodes are
+        not interrupted with canned silence (which would mute/mix into speech).
+        """
         try:
             while not self._ending:
                 session = self.negotiated
                 if (
-                    not self.talkback_enabled
-                    and self.audio
+                    self.audio
                     and session
                     and session.audio
                     and session.audio.direction in {"sendrecv", "recvonly"}
                 ):
-                    self.audio.send_silence()
+                    if not self.talkback_enabled:
+                        await self.audio.send_silence()
+                    elif self.audio.needs_uplink_gap_fill():
+                        # Talkback armed but no mic ready this ptime — keep TX alive.
+                        await self.audio.send_silence(force=True)
                 await asyncio.sleep(0.02)
         except asyncio.CancelledError:
             raise
 
-    async def _teardown(self, *, send_bye: bool) -> None:
+    async def _rtp_counter_log(self) -> None:
+        """Log audio rx/tx packet/byte counts every 5 s for the first 30 s."""
+        try:
+            started = time.monotonic()
+            while not self._ending:
+                await asyncio.sleep(RTP_COUNTER_LOG_INTERVAL)
+                if self._ending:
+                    return
+                elapsed = time.monotonic() - started
+                audio = self.audio
+                if audio is None:
+                    continue
+                msg = (
+                    f"RTP audio counters t={elapsed:.0f}s "
+                    f"rx_pkts={audio.rx_packets} rx_bytes={audio.rx_bytes} "
+                    f"tx_pkts={audio.tx_packets} tx_bytes={audio.tx_bytes}"
+                )
+                _LOGGER.info("%s", msg)
+                if self.on_log:
+                    with contextlib.suppress(Exception):
+                        self.on_log(msg)
+                if elapsed >= RTP_COUNTER_LOG_WINDOW:
+                    return
+        except asyncio.CancelledError:
+            raise
+
+    async def _teardown(self, *, send_bye: bool, discard: bool = True) -> None:
+        # Wait for an in-flight teardown instead of returning early: overlapping
+        # end() calls from on_connect / on_teardown must not race socket closes.
+        if discard:
+            self._discarded = True
         if self._ending:
+            await self._teardown_done.wait()
             return
         self._ending = True
+        self._teardown_done = asyncio.Event()
         try:
             self.talkback_enabled = False
             if self.audio:
@@ -544,9 +926,13 @@ class SrtpMediaSession:
             if send_bye:
                 with contextlib.suppress(Exception):
                     await self.sip.end_monitoring()
+            self._release_call_end_callback()
             self.negotiated = None
+            self.audio_reject_reason = None
+            self.last_answer_redacted = None
         finally:
             self._ending = False
+            self._teardown_done.set()
 
 
 def next_reconnect_delay(attempt: int) -> float:

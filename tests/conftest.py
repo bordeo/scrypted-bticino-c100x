@@ -1,11 +1,14 @@
-"""Pytest fixtures and path setup for offline C100X tests."""
+"""Shared pytest fixtures.
+
+Offline tests must not spawn the door-audio-gain ffmpeg transcoder. The
+production default is +12 dB; patch it to 0 unless a test sets the storage key.
+"""
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
+import pytest
 
-ROOT = Path(__file__).resolve().parents[1]
-SRC = ROOT / "src"
-if str(SRC) not in sys.path:
-    sys.path.insert(0, str(SRC))
+
+@pytest.fixture(autouse=True)
+def _disable_door_audio_gain_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("c100x.const.DEFAULT_DOOR_AUDIO_GAIN_DB", 0)

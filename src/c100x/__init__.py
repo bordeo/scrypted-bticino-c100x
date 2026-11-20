@@ -12,6 +12,7 @@ __all__ = [
     "sdp",
     "stun",
     "g711",
+    "audio_codec",
     "srtp_media",
     "rtsp_server",
     "talkback",

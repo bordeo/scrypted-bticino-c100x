@@ -14,6 +14,15 @@ CONF_GATEWAY_ID = "gateway_id"
 CONF_EMAIL = "email"
 CONF_PASSWORD = "password"
 CONF_ENABLE_TALKBACK = "enable_talkback"
+CONF_DOOR_AUDIO_GAIN_DB = "door_audio_gain_db"
+CONF_ENABLE_ECHO_CANCELLATION = "enable_echo_cancellation"
+CONF_EXPOSE_DOOR_OPENER = "expose_door_opener"
+CONF_LATITUDE = "latitude"
+CONF_LONGITUDE = "longitude"
+DEFAULT_DOOR_AUDIO_GAIN_DB = 12
+DOOR_AUDIO_GAIN_MIN_DB = 0
+DOOR_AUDIO_GAIN_MAX_DB = 24
+DOOR_RELOCK_SECONDS = 3.0
 
 API_BASE = "https://api.developer.legrand.com"
 API_SUBSCRIPTION_KEY = "f36968e522bf4ec3877fa491109d3d14"
@@ -45,7 +54,7 @@ SIP_KEEPALIVE_PING = b"\r\n\r\n"
 SIP_KEEPALIVE_PONG = b"\r\n"
 # Short reconnect backoff after refresh/socket failure (seconds).
 SIP_RECONNECT_BACKOFF = (1, 2, 5, 30)
-SIP_USER_AGENT = "scrypted-bticino-c100x/0.1"
+SIP_USER_AGENT = "scrypted-bticino-c100x/0.1.20"
 SIP_CLIENT_NAME = "Scrypted"
 
 # Certificate profile used by the official Classe 100X application.
@@ -62,5 +71,17 @@ STUN_BINDING_REQUEST = 0x0001
 STUN_BINDING_SUCCESS = 0x0101
 STUN_XOR_MAPPED_ADDRESS = 0x0020
 
-MEDIA_IDLE_SECONDS = 30
+# RTSP PLAY idle: HomeKit/ffmpeg often send no RTSP requests after PLAY while
+# RTP flows. 30 s killed live views (~35 s TimeoutError). Prefer GET_PARAMETER
+# keepalives + RTP activity; this is the backstop only.
+MEDIA_IDLE_SECONDS = 300
+# Log door-side RTP rx/tx counters every N seconds for the first M seconds.
+RTP_COUNTER_LOG_INTERVAL = 5.0
+RTP_COUNTER_LOG_WINDOW = 30.0
 RING_DECLINE_DELAY_SECONDS = 2
+
+# A 486 on a monitoring INVITE means the door already streams to another client
+# (HA keeps its call ~10 s after the last viewer). Retry briefly, within
+# HomeKit's patience, instead of failing the view immediately.
+MONITOR_BUSY_RETRY_SECONDS = 15
+MONITOR_BUSY_RETRY_INTERVAL = 2.0

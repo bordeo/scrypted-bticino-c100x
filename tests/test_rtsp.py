@@ -132,10 +132,23 @@ async def test_rtsp_options_describe_setup_play_teardown_and_rtp() -> None:
 
 
 @pytest.mark.asyncio
-async def test_rtsp_udp_setup_returns_461() -> None:
-    """Scrypted tries UDP first and only falls back to TCP on a status error."""
+async def test_rtsp_udp_setup_accepted() -> None:
+    """Scrypted/HomeKit try UDP first; accept client_port SETUP and forward RTP."""
     server = RtspServer(idle_seconds=5)
     url = await server.start()
+    loop = asyncio.get_running_loop()
+
+    class Collector(asyncio.DatagramProtocol):
+        def __init__(self):
+            self.packets = []
+
+        def datagram_received(self, data, addr):
+            self.packets.append(data)
+
+    transport, protocol = await loop.create_datagram_endpoint(
+        Collector, local_addr=("127.0.0.1", 0)
+    )
+    client_port = transport.get_extra_info("sockname")[1]
     reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
     try:
         resp = await _rtsp_exchange(
@@ -144,23 +157,102 @@ async def test_rtsp_udp_setup_returns_461() -> None:
             [
                 f"SETUP {url}trackID=0 RTSP/1.0",
                 "CSeq: 1",
-                "Transport: RTP/AVP;unicast;client_port=40000-40001",
+                f"Transport: RTP/AVP;unicast;client_port={client_port}-{client_port + 1}",
             ],
         )
-        assert b"461 Unsupported Transport" in resp
-        assert b"200 OK" not in resp
+        assert b"200 OK" in resp
+        assert b"client_port=" in resp
+        assert b"server_port=" in resp
 
         resp = await _rtsp_exchange(
             reader,
             writer,
+            [f"PLAY {url} RTSP/1.0", "CSeq: 2", "Session: 1"],
+        )
+        assert b"200 OK" in resp
+
+        packet = serialize_rtp(
+            payload_type=96,
+            sequence=1,
+            timestamp=0,
+            ssrc=1,
+            payload=b"\x65\x00\x01",
+            marker=True,
+        )
+        await server.forward_rtp(packet, "video")
+        for _ in range(50):
+            if protocol.packets:
+                break
+            await asyncio.sleep(0.02)
+        assert protocol.packets
+        assert protocol.packets[0] == packet
+    finally:
+        transport.close()
+        writer.close()
+        with contextlib.suppress(Exception):
+            await writer.wait_closed()
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_rtsp_forward_rtp_refreshes_last_activity() -> None:
+    """forward_rtp must touch last_activity so the idle timer stays alive."""
+    import time
+
+    server = RtspServer(idle_seconds=30.0)
+    url = await server.start()
+    reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
+    try:
+        await _rtsp_exchange(
+            reader,
+            writer,
             [
                 f"SETUP {url}trackID=0 RTSP/1.0",
-                "CSeq: 2",
+                "CSeq: 1",
                 "Transport: RTP/AVP/TCP;unicast;interleaved=0-1",
             ],
         )
-        assert b"200 OK" in resp
-        assert b"interleaved=0-1" in resp
+        await _rtsp_exchange(
+            reader, writer, [f"PLAY {url} RTSP/1.0", "CSeq: 2", "Session: 1"]
+        )
+        session = server.session
+        assert session is not None and session.playing
+        session.last_activity = time.monotonic() - 10.0
+        packet = serialize_rtp(
+            payload_type=96, sequence=1, timestamp=0, ssrc=1, payload=b"\x65"
+        )
+        await server.forward_rtp(packet, "video")
+        assert session.last_activity >= time.monotonic() - 1.0
+        assert not session.closed
+    finally:
+        writer.close()
+        with contextlib.suppress(Exception):
+            await writer.wait_closed()
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_rtsp_idle_timeout_without_rtp() -> None:
+    """With no RTP/keepalive, a short idle window tears the session down."""
+    server = RtspServer(idle_seconds=0.25)
+    url = await server.start()
+    reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
+    try:
+        await _rtsp_exchange(
+            reader,
+            writer,
+            [
+                f"SETUP {url}trackID=0 RTSP/1.0",
+                "CSeq: 1",
+                "Transport: RTP/AVP/TCP;unicast;interleaved=0-1",
+            ],
+        )
+        await _rtsp_exchange(
+            reader, writer, [f"PLAY {url} RTSP/1.0", "CSeq: 2", "Session: 1"]
+        )
+        assert server.session is not None
+        await asyncio.sleep(0.6)
+        assert server.session is None or server.session.closed
     finally:
         writer.close()
         with contextlib.suppress(Exception):

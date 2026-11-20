@@ -19,7 +19,9 @@ from c100x.const import (
 from c100x.models import SipAccount
 from c100x.sip import (
     SipClient,
+    SipError,
     SipFramer,
+    SipMessage,
     digest_authorization,
     parse_digest_challenge,
 )
@@ -168,3 +170,79 @@ def test_secrets_never_appear_in_logs(caplog: pytest.LogCaptureFixture) -> None:
     joined = " ".join(record.getMessage() for record in caplog.records)
     assert secret not in joined
     assert "credentials_rejected" in joined
+
+
+@pytest.mark.asyncio
+async def test_start_monitoring_cancelled_after_200_acks_and_exposes_dialog() -> None:
+    """A 200 after end_monitoring must ACK and raise SipError(dialog=...)."""
+    sip = make_sip(lambda _e: None)
+    sip._writer = MagicMock()
+    sip._last_transaction = {
+        "call_id": "cid-cancel",
+        "tag": "local-tag",
+        "sequence": 7,
+    }
+    ack_dialogs: list = []
+
+    async def fake_auth(method, uri, body=b"", **_kwargs):
+        assert method == "INVITE"
+        # Concurrent end_monitoring while INVITE is in flight.
+        sip._monitoring_gen += 1
+        return SipMessage(
+            "SIP/2.0 200 OK",
+            {
+                "content-type": "application/sdp",
+                "to": f"<sip:c100x@{DOMAIN_GW}>;tag=remote-tag",
+                "contact": f"<sip:c100x@{DOMAIN_GW}>",
+            },
+            b"v=0\r\n",
+        )
+
+    async def fake_ack(dialog) -> None:
+        ack_dialogs.append(dialog)
+
+    sip._authenticated_request = fake_auth  # type: ignore[method-assign]
+    sip._send_ack = fake_ack  # type: ignore[method-assign]
+
+    with pytest.raises(SipError, match="cancelled") as caught:
+        await sip.start_monitoring("v=0\r\n")
+    assert caught.value.dialog is not None
+    assert caught.value.dialog.call_id == "cid-cancel"
+    assert sip._dialog is None
+    assert ack_dialogs == [caught.value.dialog]
+
+
+@pytest.mark.asyncio
+async def test_orphan_end_monitoring_does_not_bump_generation() -> None:
+    """BYE for a cancelled dialog must not cancel a live in-flight start."""
+    sip = make_sip(lambda _e: None)
+    sip._writer = MagicMock()
+    bye_methods: list[str] = []
+
+    async def fake_dialog_request(dialog, method, sequence, wait=True):
+        bye_methods.append(method)
+        return SipMessage("SIP/2.0 200 OK", {"content-length": "0"}, b"")
+
+    sip._dialog_request = fake_dialog_request  # type: ignore[method-assign]
+    from c100x.sip import SipDialog
+
+    orphan = SipDialog(
+        call_id="orphan",
+        local_uri=f"sip:user@{DOMAIN_GW}",
+        remote_uri=f"sip:c100x@{DOMAIN_GW}",
+        local_tag="t1",
+        remote_to=f"sip:c100x@{DOMAIN_GW};tag=r1",
+        remote_target=f"sip:c100x@{DOMAIN_GW}",
+        route_set=(),
+        local_sequence=3,
+    )
+    gen_before = sip._monitoring_gen
+    await sip.end_monitoring(orphan)
+    assert sip._monitoring_gen == gen_before
+    assert bye_methods == ["BYE"]
+
+    # Ending the active dialog still bumps generation.
+    sip._dialog = orphan
+    await sip.end_monitoring()
+    assert sip._monitoring_gen == gen_before + 1
+    assert sip._dialog is None
