@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.1.20 — unreleased
+
+- Snapshots: landscape-only day/night placeholders (`placeholder_{day,night}.jpg` at 1280×720). Cover-crop to any HAP size; no portrait/`_wide` dual assets.
+- Talkback latency: inject low-probe / low-delay / declared `libopus` flags before HomeKit RTSP `-i`; log `after_ms` to first uplink frame and first non-silence frame.
+- Speex uplink quality: libspeex `-abr 0 -cbr_quality 8 -frames_per_packet 1` (~18 kbps NB), no extra resample on the PCM→Speex path.
+- Optional **Echo cancellation** setting (off by default): SpeexDSP AEC on downlink using uplink PCM as reference (`libspeexdsp`); gain still applies. Falls back if the library is missing.
+
+## 0.1.19 — local / npm
+
+- 332e740 gap-fill TX-stall fix + landscape-only placeholders (published outside this agent tree).
+
+## 0.1.18 — local / npm
+
+- Speex-aware gap-fill (9ecb49f lineage) with landscape placeholders.
+
 ## 0.1.17 — unreleased
 
 - Talkback uplink handoff: never stop silence keepalive when Intercom arms. Gap-fill canned Speex/Opus/G.711 silence when no mic is ready (~18 ms TX gap and no recent PCM / in-flight Speex encode), so TX stays alive while HomeKit return-audio ffmpeg connects or stalls (field: tx_pkts froze after `startIntercom` on 0.1.15/0.1.16) without injecting silence into healthy Speex talkback.

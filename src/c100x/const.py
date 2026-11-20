@@ -15,6 +15,7 @@ CONF_EMAIL = "email"
 CONF_PASSWORD = "password"
 CONF_ENABLE_TALKBACK = "enable_talkback"
 CONF_DOOR_AUDIO_GAIN_DB = "door_audio_gain_db"
+CONF_ENABLE_ECHO_CANCELLATION = "enable_echo_cancellation"
 CONF_EXPOSE_DOOR_OPENER = "expose_door_opener"
 CONF_LATITUDE = "latitude"
 CONF_LONGITUDE = "longitude"
@@ -53,7 +54,7 @@ SIP_KEEPALIVE_PING = b"\r\n\r\n"
 SIP_KEEPALIVE_PONG = b"\r\n"
 # Short reconnect backoff after refresh/socket failure (seconds).
 SIP_RECONNECT_BACKOFF = (1, 2, 5, 30)
-SIP_USER_AGENT = "scrypted-bticino-c100x/0.1.17"
+SIP_USER_AGENT = "scrypted-bticino-c100x/0.1.20"
 SIP_CLIENT_NAME = "Scrypted"
 
 # Certificate profile used by the official Classe 100X application.

@@ -130,6 +130,8 @@ class SpeexFfmpegEncoder:
             local_addr=("127.0.0.1", 0),
         )
         self._local_port = self._transport.get_extra_info("sockname")[1]
+        # Input is already s16le at the negotiated Speex clock — do not resample.
+        # VBR-ish quality 8 ≈ 17–20 kbps NB (matches official Door Entry uplink).
         command = [
             self.ffmpeg_path,
             "-hide_banner",
@@ -149,9 +151,11 @@ class SpeexFfmpegEncoder:
             "pipe:0",
             "-c:a",
             "libspeex",
-            "-ar",
-            str(self.sample_rate),
-            "-ac",
+            "-abr",
+            "0",
+            "-cbr_quality",
+            "8",
+            "-frames_per_packet",
             "1",
             "-flush_packets",
             "1",

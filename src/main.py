@@ -40,6 +40,7 @@ from c100x.const import (
     CERTIFICATE_RENEWAL_DAYS,
     CONF_DOOR_AUDIO_GAIN_DB,
     CONF_EMAIL,
+    CONF_ENABLE_ECHO_CANCELLATION,
     CONF_ENABLE_TALKBACK,
     CONF_EXPOSE_DOOR_OPENER,
     CONF_GATEWAY_ID,
@@ -56,10 +57,12 @@ from c100x.const import (
     MONITOR_BUSY_RETRY_SECONDS,
     RING_ACTIVE_SECONDS,
 )
+from c100x.door_audio_aec import DoorAudioAecTranscoder
 from c100x.downlink_gain import (
     DoorAudioGainTranscoder,
     clamp_door_audio_gain_db,
 )
+from c100x.echo_cancel import EchoCanceller, speexdsp_available
 from c100x.models import SipAccount
 from c100x.rtsp_server import RtspServer, RtspSession
 from c100x.sdp import NegotiatedSession, SdpError, format_negotiated_audio, select_audio_codec
@@ -133,13 +136,22 @@ class C100XDoorbell(
         self._prebuffer_warned = False
         self._logged_first_video = False
         self._logged_first_audio = False
-        self._audio_gain: DoorAudioGainTranscoder | None = None
+        self._audio_gain: DoorAudioGainTranscoder | DoorAudioAecTranscoder | None = None
+        self._echo: EchoCanceller | None = None
 
     # --- Settings ---------------------------------------------------------
 
     def _talkback_enabled(self) -> bool:
         try:
             return bool(_json_get(self.plugin.storage, CONF_ENABLE_TALKBACK, False))
+        except Exception:
+            return False
+
+    def _echo_cancellation_enabled(self) -> bool:
+        try:
+            return bool(
+                _json_get(self.plugin.storage, CONF_ENABLE_ECHO_CANCELLATION, False)
+            )
         except Exception:
             return False
 
@@ -192,6 +204,18 @@ class C100XDoorbell(
                     "0 keeps Speex/Opus RTP passthrough. Takes effect on the next call."
                 ),
             },
+            {
+                "key": CONF_ENABLE_ECHO_CANCELLATION,
+                "title": "Echo cancellation",
+                "type": "boolean",
+                "value": self._echo_cancellation_enabled(),
+                "description": (
+                    "Off by default. When on, SpeexDSP AEC cleans door→phone audio using "
+                    "your uplink PCM as the reference (helps when the outdoor speaker "
+                    "couples into the door mic). Requires libspeexdsp on the host. "
+                    "Takes effect on the next call; gain still applies."
+                ),
+            },
         ]
         if self._prebuffer_active():
             settings.append(
@@ -221,6 +245,13 @@ class C100XDoorbell(
         if key == CONF_DOOR_AUDIO_GAIN_DB:
             gain = clamp_door_audio_gain_db(value)
             _json_set(self.plugin.storage, CONF_DOOR_AUDIO_GAIN_DB, gain)
+            await scrypted_sdk.deviceManager.onDeviceEvent(
+                self.nativeId, ScryptedInterface.Settings.value, None
+            )
+            return
+        if key == CONF_ENABLE_ECHO_CANCELLATION:
+            enabled = value in (True, "true", "True", 1, "1")
+            _json_set(self.plugin.storage, CONF_ENABLE_ECHO_CANCELLATION, enabled)
             await scrypted_sdk.deviceManager.onDeviceEvent(
                 self.nativeId, ScryptedInterface.Settings.value, None
             )
@@ -625,6 +656,10 @@ class C100XDoorbell(
         if gain:
             with contextlib.suppress(Exception):
                 await gain.close()
+        echo, self._echo = self._echo, None
+        if echo:
+            with contextlib.suppress(Exception):
+                echo.close()
         media, self._media = self._media, None
         if media:
             with contextlib.suppress(Exception):
@@ -633,9 +668,12 @@ class C100XDoorbell(
     async def _start_audio_gain(
         self, session_neg: NegotiatedSession, ffmpeg_path: str | None
     ) -> None:
-        """Start Speex/Opus/G.711 → gain → Opus when the setting is > 0 dB."""
+        """Start door→HomeKit audio processing (gain and/or AEC → Opus)."""
         gain_db = self._door_audio_gain_db()
-        if gain_db <= 0 or session_neg.audio is None:
+        want_aec = self._echo_cancellation_enabled()
+        if session_neg.audio is None:
+            return
+        if gain_db <= 0 and not want_aec:
             return
         codec = select_audio_codec(session_neg.audio)
         if codec is None:
@@ -644,11 +682,61 @@ class C100XDoorbell(
         if previous:
             with contextlib.suppress(Exception):
                 await previous.close()
+        echo, self._echo = self._echo, None
+        if echo:
+            with contextlib.suppress(Exception):
+                echo.close()
 
         async def _forward_opus(packet: bytes) -> None:
             if self._rtsp:
                 await self._rtsp.forward_rtp(packet, "audio")
 
+        if want_aec:
+            if not speexdsp_available():
+                self.print(
+                    "Echo cancellation requested but libspeexdsp is missing — "
+                    "falling back to gain-only / passthrough"
+                )
+                want_aec = False
+            else:
+                try:
+                    rate = int(getattr(codec, "clock_rate", 8000) or 8000)
+                    if str(codec.name).casefold() == "opus":
+                        rate = 48000
+                    self._echo = EchoCanceller(sample_rate=rate)
+                    transcoder: DoorAudioGainTranscoder | DoorAudioAecTranscoder = (
+                        DoorAudioAecTranscoder(
+                            gain_db=gain_db,
+                            echo=self._echo,
+                            on_opus_rtp=_forward_opus,
+                            ffmpeg_path=ffmpeg_path,
+                            on_log=self.print,
+                        )
+                    )
+                    await transcoder.start(codec)
+                except Exception as err:
+                    self.print(
+                        f"Door audio AEC failed; falling back: {type(err).__name__}"
+                    )
+                    if self._echo:
+                        with contextlib.suppress(Exception):
+                            self._echo.close()
+                        self._echo = None
+                    want_aec = False
+                else:
+                    if transcoder.active and self._media is not None and self._rtsp is not None:
+                        self._audio_gain = transcoder
+                        return
+                    with contextlib.suppress(Exception):
+                        await transcoder.close()
+                    if self._echo:
+                        with contextlib.suppress(Exception):
+                            self._echo.close()
+                        self._echo = None
+                    want_aec = False
+
+        if gain_db <= 0:
+            return
         transcoder = DoorAudioGainTranscoder(
             gain_db=gain_db,
             on_opus_rtp=_forward_opus,
@@ -733,7 +821,15 @@ class C100XDoorbell(
             self.print("startIntercom: refused — expected FFmpegInput JSON")
             raise TalkbackError("Expected FFmpegInput JSON for talkback")
         ffmpeg = await scrypted_sdk.mediaManager.getFFmpegPath()
-        pipeline = TalkbackPipeline(self._media, on_log=self.print)
+
+        def _on_uplink_pcm(pcm: bytes) -> None:
+            if self._echo is not None:
+                with contextlib.suppress(Exception):
+                    self._echo.playback(pcm)
+
+        pipeline = TalkbackPipeline(
+            self._media, on_log=self.print, on_pcm=_on_uplink_pcm
+        )
         try:
             await pipeline.start(ffmpeg, ffmpeg_input)
         except MediaSessionError as err:

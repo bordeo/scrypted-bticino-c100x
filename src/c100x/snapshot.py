@@ -1,10 +1,9 @@
 """Snapshot JPEG helpers: day/night placeholders and HAP size cover-crop.
 
 HomeKit / Scrypted may request a width×height (often 1280×720 for the Cameras
-tile). We pick the placeholder whose aspect is closest to the request
-(portrait vs wide), center-crop (cover — never stretch), then resize to the
-exact requested pixel size (long side capped at 1280). Without a requested
-size we return the wide asset as-is (HomeKit tiles default ~16:9).
+tile). We load the landscape day/night placeholder, center-crop (cover — never
+stretch), then resize to the exact requested pixel size (long side capped at
+1280). Without a requested size we return the landscape asset as-is.
 """
 
 from __future__ import annotations
@@ -13,11 +12,7 @@ import io
 import logging
 from typing import Any
 
-from .assets import (
-    PLACEHOLDER_PORTRAIT_SIZE,
-    PLACEHOLDER_WIDE_SIZE,
-    load_placeholder_jpeg,
-)
+from .assets import load_placeholder_jpeg
 from .sun import (
     DEFAULT_LATITUDE,
     DEFAULT_LONGITUDE,
@@ -105,16 +100,6 @@ def parse_picture_size(options: Any) -> tuple[int, int] | None:
     return width, height
 
 
-def closest_placeholder_orientation(width: int, height: int) -> str:
-    """Return ``'wide'`` or ``'portrait'`` closest to the requested aspect."""
-    req_aspect = width / float(height)
-    portrait_aspect = PLACEHOLDER_PORTRAIT_SIZE[0] / float(PLACEHOLDER_PORTRAIT_SIZE[1])
-    wide_aspect = PLACEHOLDER_WIDE_SIZE[0] / float(PLACEHOLDER_WIDE_SIZE[1])
-    if abs(req_aspect - wide_aspect) <= abs(req_aspect - portrait_aspect):
-        return "wide"
-    return "portrait"
-
-
 def resize_jpeg_cover(
     jpeg: bytes,
     width: int,
@@ -139,12 +124,10 @@ def resize_jpeg_cover(
             image = image.convert("RGB")
             box = cover_crop_box(image.width, image.height, out_w, out_h)
             cropped = image.crop(box)
-            # Uniform scale only — crop already matches dest aspect.
             crop_w = box[2] - box[0]
             crop_h = box[3] - box[1]
             if crop_w <= 0 or crop_h <= 0:
                 return jpeg
-            # Sanity: crop aspect ≈ dest aspect (no stretch path).
             if abs((crop_w / crop_h) - (out_w / out_h)) > 0.05:
                 _LOGGER.warning(
                     "Snapshot crop aspect drifted (crop=%sx%s dest=%sx%s)",
@@ -168,24 +151,15 @@ def choose_placeholder_jpeg(
     longitude: float = DEFAULT_LONGITUDE,
     tz_name: str = DEFAULT_TIMEZONE,
     when=None,
-    width: int | None = None,
-    height: int | None = None,
 ) -> bytes:
-    """Load day/night placeholder; pick wide vs portrait by requested aspect.
-
-    No size → wide (HomeKit Cameras tile is ~16:9).
-    """
+    """Load day/night landscape placeholder for the configured coordinates."""
     night = not is_daylight(
         when,
         latitude=clamp_latitude(latitude),
         longitude=clamp_longitude(longitude),
         tz_name=tz_name,
     )
-    if width is None or height is None or width <= 0 or height <= 0:
-        wide = True
-    else:
-        wide = closest_placeholder_orientation(width, height) == "wide"
-    return load_placeholder_jpeg(night=night, wide=wide)
+    return load_placeholder_jpeg(night=night)
 
 
 def render_snapshot_jpeg(
@@ -199,27 +173,18 @@ def render_snapshot_jpeg(
 ) -> bytes:
     """Build the final snapshot JPEG for ``takePicture``.
 
-    If ``jpeg`` is None, choose a day/night placeholder. Always cover-crop to
-    the requested size when present; otherwise return the wide placeholder.
+    If ``jpeg`` is None, choose a day/night landscape placeholder. Always
+    cover-crop to the requested size when present; otherwise return the
+    landscape asset as-is.
     """
     size = parse_picture_size(options)
     if jpeg is None:
-        if size is not None:
-            jpeg = choose_placeholder_jpeg(
-                latitude=latitude,
-                longitude=longitude,
-                tz_name=tz_name,
-                when=when,
-                width=size[0],
-                height=size[1],
-            )
-        else:
-            jpeg = choose_placeholder_jpeg(
-                latitude=latitude,
-                longitude=longitude,
-                tz_name=tz_name,
-                when=when,
-            )
+        jpeg = choose_placeholder_jpeg(
+            latitude=latitude,
+            longitude=longitude,
+            tz_name=tz_name,
+            when=when,
+        )
     if size is not None:
         return resize_jpeg_cover(jpeg, size[0], size[1])
     return jpeg

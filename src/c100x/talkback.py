@@ -10,10 +10,12 @@ without a mic frame so TX never stalls while ffmpeg connects or buffers.
 
 from __future__ import annotations
 
+import array
 import asyncio
 import contextlib
 import logging
 import shlex
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -24,6 +26,46 @@ _LOGGER = logging.getLogger(__name__)
 # Bound blocking reads so a stalled HomeKit RTSP source cannot freeze the pump;
 # silence keepalive covers the gap.
 _STDOUT_READ_TIMEOUT_S = 0.05
+# Treat PCM as silence when peak |sample| stays below this (s16).
+_SILENCE_PEAK = 96
+
+
+def pcm_peak_abs(pcm: bytes) -> int:
+    if len(pcm) < 2:
+        return 0
+    samples = array.array("h")
+    samples.frombytes(pcm[: len(pcm) - (len(pcm) % 2)])
+    return max((abs(s) for s in samples), default=0)
+
+
+def inject_low_latency_input_args(input_args: list[str]) -> list[str]:
+    """Ensure low-latency / no-probe flags appear before the first ``-i``.
+
+    HomeKit return audio is usually Opus over RTSP. Declaring the codec and
+    skipping probe cuts seconds off startIntercom → first PCM.
+    """
+    args = [str(a) for a in input_args]
+    hay = " ".join(args).casefold()
+    if "-i" not in args:
+        return args
+    i_at = args.index("-i")
+    head, tail = args[:i_at], args[i_at:]
+    extras: list[str] = []
+    # Always prefer tiny probe for RTSP/HTTP return audio.
+    if "rtsp://" in hay or "-rtsp_transport" in hay:
+        for flag, value in (
+            ("-fflags", "nobuffer"),
+            ("-flags", "low_delay"),
+            ("-probesize", "32"),
+            ("-analyzeduration", "0"),
+            ("-thread_queue_size", "64"),
+        ):
+            if flag not in head and flag not in tail:
+                extras.extend([flag, value])
+        # Declare Opus when HomeKit did not (avoids demuxer probe delay).
+        if "-acodec" not in head and "-acodec" not in tail and "-c:a" not in head:
+            extras.extend(["-acodec", "libopus"])
+    return extras + head + tail
 
 
 class TalkbackError(RuntimeError):
@@ -37,15 +79,19 @@ class TalkbackPipeline:
         self,
         media: SrtpMediaSession,
         on_log: Callable[[str], None] | None = None,
+        on_pcm: Callable[[bytes], None] | None = None,
     ) -> None:
         self.media = media
         self.on_log = on_log
+        self.on_pcm = on_pcm
         self._process: asyncio.subprocess.Process | None = None
         self._task: asyncio.Task[None] | None = None
         self._stderr_task: asyncio.Task[None] | None = None
         self._active = False
         self._frame_bytes = 320
         self._frames_sent = 0
+        self._started_mono = 0.0
+        self._first_nonsilence_logged = False
 
     def _emit(self, message: str) -> None:
         _LOGGER.info("%s", message)
@@ -68,6 +114,8 @@ class TalkbackPipeline:
         await self.stop()
         self._frame_bytes = fmt.frame_bytes
         self._frames_sent = 0
+        self._first_nonsilence_logged = False
+        self._started_mono = time.monotonic()
         url = ffmpeg_input.get("url") or ""
         input_args = list(ffmpeg_input.get("inputArguments") or [])
         command = [
@@ -77,28 +125,33 @@ class TalkbackPipeline:
             "error",
             "-nostdin",
         ]
-        # HomeKit return audio is RTSP — low-latency flags help connect fast.
-        # Do not apply to lavfi/file inputs (nobuffer truncates short generators).
-        haystack = " ".join([str(url), *[str(a) for a in input_args]]).casefold()
-        if "rtsp://" in haystack:
-            command.extend(
-                [
-                    "-fflags",
-                    "nobuffer",
-                    "-flags",
-                    "low_delay",
-                    "-probesize",
-                    "32",
-                    "-analyzeduration",
-                    "0",
-                ]
-            )
         if input_args:
-            command.extend(str(arg) for arg in input_args)
+            command.extend(inject_low_latency_input_args(input_args))
         elif url:
+            hay = str(url).casefold()
+            if hay.startswith("rtsp://"):
+                command.extend(
+                    [
+                        "-fflags",
+                        "nobuffer",
+                        "-flags",
+                        "low_delay",
+                        "-probesize",
+                        "32",
+                        "-analyzeduration",
+                        "0",
+                        "-thread_queue_size",
+                        "64",
+                        "-rtsp_transport",
+                        "tcp",
+                        "-acodec",
+                        "libopus",
+                    ]
+                )
             command.extend(["-i", str(url)])
         else:
             raise TalkbackError("FFmpegInput has no url or inputArguments")
+        # Output PCM at the negotiated uplink clock only (no extra resamples).
         command.extend(
             [
                 "-vn",
@@ -202,14 +255,29 @@ class TalkbackPipeline:
                 while len(buf) >= self._frame_bytes:
                     frame = bytes(buf[: self._frame_bytes])
                     del buf[: self._frame_bytes]
+                    if self.on_pcm:
+                        with contextlib.suppress(Exception):
+                            self.on_pcm(frame)
                     self.media.send_talkback_pcm(frame)
                     self._frames_sent += 1
                     if self._frames_sent == 1:
+                        elapsed_ms = int((time.monotonic() - self._started_mono) * 1000)
                         audio = self.media.audio
                         self._emit(
                             "talkback first uplink frame sent "
-                            f"(bytes={len(frame)} tx_pkts="
+                            f"(bytes={len(frame)} peak={pcm_peak_abs(frame)} "
+                            f"after_ms={elapsed_ms} tx_pkts="
                             f"{getattr(audio, 'tx_packets', '?')})"
+                        )
+                    if (
+                        not self._first_nonsilence_logged
+                        and pcm_peak_abs(frame) >= _SILENCE_PEAK
+                    ):
+                        self._first_nonsilence_logged = True
+                        elapsed_ms = int((time.monotonic() - self._started_mono) * 1000)
+                        self._emit(
+                            "talkback first non-silence uplink frame "
+                            f"(peak={pcm_peak_abs(frame)} after_ms={elapsed_ms})"
                         )
         except asyncio.CancelledError:
             raise
