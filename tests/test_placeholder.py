@@ -11,14 +11,18 @@ from PIL import Image
 
 from c100x.assets import (
     PLACEHOLDER_DAY_PATH,
+    PLACEHOLDER_DAY_WIDE_PATH,
     PLACEHOLDER_NIGHT_PATH,
+    PLACEHOLDER_NIGHT_WIDE_PATH,
     load_placeholder_jpeg,
 )
 from c100x.snapshot import (
     choose_placeholder_jpeg,
+    closest_placeholder_orientation,
     cover_crop_box,
     fit_within_long_side,
     parse_picture_size,
+    render_snapshot_jpeg,
     resize_jpeg_cover,
 )
 from c100x.sun import DEFAULT_TIMEZONE, is_daylight, solar_events
@@ -27,13 +31,19 @@ from c100x.sun import DEFAULT_TIMEZONE, is_daylight, solar_events
 def test_placeholder_day_night_assets_exist() -> None:
     assert PLACEHOLDER_DAY_PATH.is_file()
     assert PLACEHOLDER_NIGHT_PATH.is_file()
+    assert PLACEHOLDER_DAY_WIDE_PATH.is_file()
+    assert PLACEHOLDER_NIGHT_WIDE_PATH.is_file()
     day = load_placeholder_jpeg(night=False)
     night = load_placeholder_jpeg(night=True)
-    assert day.startswith(b"\xff\xd8\xff") and day.endswith(b"\xff\xd9")
-    assert night.startswith(b"\xff\xd8\xff") and night.endswith(b"\xff\xd9")
-    assert len(day) < 100_000 and len(night) < 100_000
+    day_w = load_placeholder_jpeg(night=False, wide=True)
+    night_w = load_placeholder_jpeg(night=True, wide=True)
+    for blob in (day, night, day_w, night_w):
+        assert blob.startswith(b"\xff\xd8\xff") and blob.endswith(b"\xff\xd9")
+        assert len(blob) < 100_000
     with Image.open(PLACEHOLDER_DAY_PATH) as img:
         assert img.size == (576, 1024)
+    with Image.open(PLACEHOLDER_DAY_WIDE_PATH) as img:
+        assert img.size == (1280, 720)
 
 
 def test_cover_crop_box_wider_source() -> None:
@@ -66,12 +76,79 @@ def test_parse_picture_size() -> None:
     assert parse_picture_size({"width": 100, "height": 0}) is None
 
 
+def test_closest_placeholder_orientation() -> None:
+    assert closest_placeholder_orientation(1280, 720) == "wide"
+    assert closest_placeholder_orientation(1920, 1080) == "wide"
+    assert closest_placeholder_orientation(720, 1280) == "portrait"
+    assert closest_placeholder_orientation(576, 1024) == "portrait"
+    # Square is closer to portrait (9:16) than 16:9? 1.0 vs 0.5625 vs 1.777…
+    # |1-1.777|=0.777, |1-0.5625|=0.4375 → portrait
+    assert closest_placeholder_orientation(800, 800) == "portrait"
+
+
 def test_resize_jpeg_cover_matches_requested_size() -> None:
-    raw = load_placeholder_jpeg(night=False)
+    raw = load_placeholder_jpeg(night=False, wide=True)
     out = resize_jpeg_cover(raw, 320, 240)
     with Image.open(io.BytesIO(out)) as img:
         assert img.size == (320, 240)
         assert img.format == "JPEG"
+
+
+def _red_marker_aspect(jpeg: bytes) -> float:
+    """Return width/height of the red marker bounding box (should stay ~1.0)."""
+    with Image.open(io.BytesIO(jpeg)) as img:
+        rgb = img.convert("RGB")
+        pixels = rgb.load()
+        xs: list[int] = []
+        ys: list[int] = []
+        for y in range(rgb.height):
+            for x in range(rgb.width):
+                r, g, b = pixels[x, y]
+                if r > 150 and g < 80 and b < 80:
+                    xs.append(x)
+                    ys.append(y)
+        assert xs and ys, "expected red marker in stub asset"
+        return (max(xs) - min(xs) + 1) / float(max(ys) - min(ys) + 1)
+
+
+def test_render_1280x720_uses_wide_no_distortion() -> None:
+    """HomeKit Cameras tile: exact 1280×720, content aspect preserved (no stretch)."""
+    tz = ZoneInfo(DEFAULT_TIMEZONE)
+    out = render_snapshot_jpeg(
+        when=datetime(2024, 6, 21, 12, 0, tzinfo=tz),
+        options={"picture": {"width": 1280, "height": 720}},
+    )
+    with Image.open(io.BytesIO(out)) as img:
+        assert img.size == (1280, 720)
+        assert img.format == "JPEG"
+    # Wide stub has a centered square red marker — must stay square after cover.
+    assert abs(_red_marker_aspect(out) - 1.0) < 0.08
+    # Same bytes path as choosing the wide day asset then cover to itself.
+    assert choose_placeholder_jpeg(
+        when=datetime(2024, 6, 21, 12, 0, tzinfo=tz), width=1280, height=720
+    ) == load_placeholder_jpeg(night=False, wide=True)
+
+
+def test_render_720x1280_returns_portrait() -> None:
+    tz = ZoneInfo(DEFAULT_TIMEZONE)
+    out = render_snapshot_jpeg(
+        when=datetime(2024, 6, 21, 12, 0, tzinfo=tz),
+        options={"picture": {"width": 720, "height": 1280}},
+    )
+    with Image.open(io.BytesIO(out)) as img:
+        assert img.size == (720, 1280)
+        assert img.format == "JPEG"
+    assert choose_placeholder_jpeg(
+        when=datetime(2024, 6, 21, 12, 0, tzinfo=tz), width=720, height=1280
+    ) == load_placeholder_jpeg(night=False, wide=False)
+
+
+def test_render_default_returns_wide() -> None:
+    tz = ZoneInfo(DEFAULT_TIMEZONE)
+    out = render_snapshot_jpeg(when=datetime(2024, 6, 21, 12, 0, tzinfo=tz))
+    assert out == load_placeholder_jpeg(night=False, wide=True)
+    with Image.open(io.BytesIO(out)) as img:
+        assert img.size == (1280, 720)
 
 
 def test_solar_events_peraga_summer_winter() -> None:
@@ -98,8 +175,8 @@ def test_choose_placeholder_switches_day_night() -> None:
     tz = ZoneInfo(DEFAULT_TIMEZONE)
     day = choose_placeholder_jpeg(when=datetime(2024, 6, 21, 12, 0, tzinfo=tz))
     night = choose_placeholder_jpeg(when=datetime(2024, 6, 21, 0, 30, tzinfo=tz))
-    assert day == load_placeholder_jpeg(night=False)
-    assert night == load_placeholder_jpeg(night=True)
+    assert day == load_placeholder_jpeg(night=False, wide=True)
+    assert night == load_placeholder_jpeg(night=True, wide=True)
 
 
 @pytest.mark.asyncio
@@ -124,3 +201,48 @@ async def test_take_picture_honors_requested_size() -> None:
     # stub createMediaObject returns data as-is
     with Image.open(io.BytesIO(jpeg)) as img:
         assert img.size == (200, 100)
+
+
+@pytest.mark.asyncio
+async def test_get_picture_options_advertise_wide() -> None:
+    from sdk_stub import install as install_sdk
+
+    install_sdk()
+    import main as plugin_main
+
+    class FakeStorage:
+        def getItem(self, key):
+            return None
+
+        def setItem(self, key, value):
+            pass
+
+    plugin = plugin_main.C100XPlugin.__new__(plugin_main.C100XPlugin)
+    plugin.storage = FakeStorage()
+    device = plugin_main.C100XDoorbell("doorbell", plugin)
+    opts = await device.getPictureOptions()
+    assert opts[0]["picture"] == {"width": 1280, "height": 720}
+    assert opts[0]["canResize"] is True
+
+
+@pytest.mark.asyncio
+async def test_take_picture_default_is_wide_16x9() -> None:
+    from sdk_stub import install as install_sdk
+
+    install_sdk()
+    import main as plugin_main
+
+    class FakeStorage:
+        def getItem(self, key):
+            return None
+
+        def setItem(self, key, value):
+            pass
+
+    plugin = plugin_main.C100XPlugin.__new__(plugin_main.C100XPlugin)
+    plugin.storage = FakeStorage()
+    device = plugin_main.C100XDoorbell("doorbell", plugin)
+    device._last_jpeg = None
+    jpeg = await device.takePicture(None)
+    with Image.open(io.BytesIO(jpeg)) as img:
+        assert img.size == (1280, 720)

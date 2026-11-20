@@ -53,7 +53,7 @@ SIP_KEEPALIVE_PING = b"\r\n\r\n"
 SIP_KEEPALIVE_PONG = b"\r\n"
 # Short reconnect backoff after refresh/socket failure (seconds).
 SIP_RECONNECT_BACKOFF = (1, 2, 5, 30)
-SIP_USER_AGENT = "scrypted-bticino-c100x/0.1.14"
+SIP_USER_AGENT = "scrypted-bticino-c100x/0.1.16"
 SIP_CLIENT_NAME = "Scrypted"
 
 # Certificate profile used by the official Classe 100X application.

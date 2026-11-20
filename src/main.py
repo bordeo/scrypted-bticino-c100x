@@ -64,11 +64,7 @@ from c100x.models import SipAccount
 from c100x.rtsp_server import RtspServer, RtspSession
 from c100x.sdp import NegotiatedSession, SdpError, format_negotiated_audio, select_audio_codec
 from c100x.sip import SipClient, SipError
-from c100x.snapshot import (
-    choose_placeholder_jpeg,
-    parse_picture_size,
-    resize_jpeg_cover,
-)
+from c100x.snapshot import render_snapshot_jpeg
 from c100x.srtp_media import MediaSessionError, SrtpMediaSession, new_client_id, next_reconnect_delay
 from c100x.sun import (
     DEFAULT_LATITUDE,
@@ -290,12 +286,13 @@ class C100XDoorbell(
     # --- Camera / snapshots -----------------------------------------------
 
     async def getPictureOptions(self):
-        # Native asset is 576×1024 portrait; HomeKit may request other sizes (canResize).
+        # Advertise 16:9 so HomeKit's Cameras tile does not stretch a portrait.
+        # canResize: we cover-crop to whatever HAP requests (portrait or landscape).
         return [
             {
                 "id": "default",
                 "name": "Citofono",
-                "picture": {"width": 576, "height": 1024},
+                "picture": {"width": 1280, "height": 720},
                 "canResize": True,
             }
         ]
@@ -311,20 +308,19 @@ class C100XDoorbell(
     async def takePicture(self, options=None) -> MediaObject:
         """Return a recent keyframe JPEG, else day/night placeholder.
 
-        Never places a monitoring SIP call for snapshots. When HomeKit passes
-        a requested size, center-crop (cover) and resize (long side ≤ 1280).
+        Never places a monitoring SIP call for snapshots. Picks portrait vs wide
+        by requested aspect, then cover-crops to the exact HAP size (no stretch).
+        Without a size, returns the wide placeholder (HomeKit tiles ≈16:9).
         """
         self._warn_prebuffer()
-        if self._last_jpeg:
-            jpeg = self._last_jpeg
-        else:
-            lat, lon = self._snapshot_coords()
-            jpeg = choose_placeholder_jpeg(
-                latitude=lat, longitude=lon, tz_name=DEFAULT_TIMEZONE
-            )
-        size = parse_picture_size(options)
-        if size is not None:
-            jpeg = resize_jpeg_cover(jpeg, size[0], size[1])
+        lat, lon = self._snapshot_coords()
+        jpeg = render_snapshot_jpeg(
+            jpeg=self._last_jpeg,
+            latitude=lat,
+            longitude=lon,
+            tz_name=DEFAULT_TIMEZONE,
+            options=options,
+        )
         return await scrypted_sdk.mediaManager.createMediaObject(jpeg, "image/jpeg")
 
     async def _cache_keyframe_jpeg(self, nal_payload: bytes) -> None:

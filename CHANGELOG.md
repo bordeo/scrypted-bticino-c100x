@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.16 — unreleased
+
+- Snapshots: portrait + landscape day/night assets (`placeholder_{day,night}.jpg` and `placeholder_{day,night}_wide.jpg`). Pick the closest aspect to the HAP request, then cover-crop (never stretch) to the exact size (long side ≤1280). No size → wide 16:9 asset. `getPictureOptions` advertises 1280×720 so HomeKit’s Cameras tile does not stretch a portrait.
+
+## 0.1.15 — local only
+
+- Published from branch + local placeholder image swap (not a distinct commit on this PR).
+
 ## 0.1.14 — unreleased
 
 - Door audio gain: plugin setting **Door audio gain (dB)** (default +12, range 0–24). Downlink Speex/Opus/G.711 is still SRTP→RTP into local RTSP; HomeKit’s remux has no plugin `volume=` hook, so when gain > 0 the plugin transcodes in-path (ffmpeg decode → `volume=NdB,alimiter` → Opus) and advertises Opus on the RTSP audio track. Gain 0 keeps RTP passthrough.
