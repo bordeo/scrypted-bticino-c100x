@@ -186,8 +186,9 @@ class TalkbackPipeline:
                         self._process.stdout.read(self._frame_bytes),
                         timeout=_STDOUT_READ_TIMEOUT_S,
                     )
-                except TimeoutError:
+                except (TimeoutError, asyncio.TimeoutError):
                     # No PCM this slot — silence keepalive gap-fills uplink.
+                    # Py3.10: wait_for raises asyncio.TimeoutError (not builtin).
                     if self._process.returncode is not None:
                         self._emit(
                             f"talkback ffmpeg exited (code={self._process.returncode})"

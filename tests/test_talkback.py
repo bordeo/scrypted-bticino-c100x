@@ -57,6 +57,9 @@ class GapFillAudio:
     def __init__(self) -> None:
         self.silence_force: list[bool] = []
         self._last_tx_mono = 0.0
+        self._mic_queued_mono = 0.0
+        self._speex_chain: asyncio.Task | None = None
+        self._talkback = True
         self.tx_packets = 0
 
     @property
@@ -68,7 +71,34 @@ class GapFillAudio:
             return 999.0
         return (time.monotonic() if now is None else now) - self._last_tx_mono
 
+    def needs_uplink_gap_fill(
+        self,
+        *,
+        gap_fill_after: float = 0.018,
+        encode_budget: float = 0.1,
+        now: float | None = None,
+    ) -> bool:
+        # Mirror _MediaRtpProtocol.needs_uplink_gap_fill for the keepalive test.
+        now = time.monotonic() if now is None else now
+        if self.tx_gap_seconds(now) < gap_fill_after:
+            return False
+        if not self._talkback:
+            return True
+        mic_age = (
+            now - self._mic_queued_mono if self._mic_queued_mono > 0.0 else 999.0
+        )
+        inflight = self._speex_chain is not None and not self._speex_chain.done()
+        if inflight and mic_age < encode_budget:
+            return False
+        if mic_age < gap_fill_after:
+            return False
+        return True
+
+    def note_mic_queued(self) -> None:
+        self._mic_queued_mono = time.monotonic()
+
     def note_mic_tx(self) -> None:
+        self._mic_queued_mono = time.monotonic()
         self._last_tx_mono = time.monotonic()
         self.tx_packets += 1
 
@@ -159,7 +189,26 @@ async def test_uplink_handoff_gap_fills_silence_until_mic_flows() -> None:
         )
         assert audio.tx_packets > before_mic
 
-        # Phase 3: mic stalls — silence resumes (force=True).
+        # Phase 3: Speex-like encode in flight (TX stale, mic just queued) —
+        # must NOT inject silence into healthy talkback.
+        audio.silence_force.clear()
+
+        async def _slow_encode() -> None:
+            await asyncio.sleep(0.08)
+
+        audio._speex_chain = asyncio.create_task(_slow_encode())
+        audio.note_mic_queued()
+        # Age the last TX so a naive gap check would fire.
+        audio._last_tx_mono = time.monotonic() - 0.05
+        await asyncio.sleep(0.06)
+        assert not audio.silence_force, (
+            f"in-flight Speex encode must not get silence injected: {audio.silence_force!r}"
+        )
+        await audio._speex_chain
+        audio._speex_chain = None
+        audio.note_mic_tx()
+
+        # Phase 4: mic stalls — silence resumes (force=True).
         audio.silence_force.clear()
         await asyncio.sleep(0.12)
         assert any(audio.silence_force), "silence must resume when mic stalls"
@@ -168,6 +217,31 @@ async def test_uplink_handoff_gap_fills_silence_until_mic_flows() -> None:
         session._ending = True
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+
+
+def test_needs_uplink_gap_fill_speex_inflight() -> None:
+    """Unit: TX gap alone must not gap-fill while Speex encode is in flight."""
+    from c100x.srtp_media import _MediaRtpProtocol
+
+    class _Inflight:
+        def done(self) -> bool:
+            return False
+
+    class _Done:
+        def done(self) -> bool:
+            return True
+
+    proto = _MediaRtpProtocol("audio", lambda *_: None)
+    proto._talkback = True
+    proto._last_tx_mono = time.monotonic() - 0.05
+    proto._mic_queued_mono = time.monotonic()
+    proto._speex_chain = _Inflight()  # type: ignore[assignment]
+    assert proto.needs_uplink_gap_fill() is False
+    proto._speex_chain = _Done()  # type: ignore[assignment]
+    proto._mic_queued_mono = time.monotonic() - 0.05
+    assert proto.needs_uplink_gap_fill() is True
+    proto._speex_chain = None
+    assert proto.needs_uplink_gap_fill() is True
 
 
 @pytest.mark.asyncio

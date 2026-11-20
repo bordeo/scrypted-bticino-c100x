@@ -215,6 +215,8 @@ class _MediaRtpProtocol(asyncio.DatagramProtocol):
         # Monotonic time of last uplink TX (silence or mic). Used to gap-fill
         # silence during talkback so the door never sees a TX stall.
         self._last_tx_mono = 0.0
+        # When mic PCM was last accepted (before Speex async encode finishes).
+        self._mic_queued_mono = 0.0
         self.rx_packets = 0
         self.rx_bytes = 0
         self.tx_packets = 0
@@ -229,6 +231,36 @@ class _MediaRtpProtocol(asyncio.DatagramProtocol):
         if self._last_tx_mono <= 0.0:
             return 999.0
         return (time.monotonic() if now is None else now) - self._last_tx_mono
+
+    def needs_uplink_gap_fill(
+        self,
+        *,
+        gap_fill_after: float = 0.018,
+        encode_budget: float = 0.1,
+        now: float | None = None,
+    ) -> bool:
+        """Return True when keepalive should inject silence this tick.
+
+        Speex mic frames only update ``_last_tx_mono`` after async encode, so a
+        naive 18 ms TX-gap check would inject canned silence into healthy
+        talkback. Treat recent PCM accept / in-flight Speex encode as "frame
+        ready" and only gap-fill when those are also stale (or encode exceeds
+        ``encode_budget``).
+        """
+        now = time.monotonic() if now is None else now
+        if self.tx_gap_seconds(now) < gap_fill_after:
+            return False
+        if not self._talkback:
+            return True
+        mic_age = (
+            now - self._mic_queued_mono if self._mic_queued_mono > 0.0 else 999.0
+        )
+        inflight = self._speex_chain is not None and not self._speex_chain.done()
+        if inflight and mic_age < encode_budget:
+            return False
+        if mic_age < gap_fill_after:
+            return False
+        return True
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
         self.transport = transport  # type: ignore[assignment]
@@ -336,6 +368,7 @@ class _MediaRtpProtocol(asyncio.DatagramProtocol):
         self._talkback = enabled
         if not enabled:
             self._pcm.clear()
+            self._mic_queued_mono = 0.0
             self._speex_epoch += 1
             chain, self._speex_chain = self._speex_chain, None
             if chain is not None:
@@ -375,6 +408,9 @@ class _MediaRtpProtocol(asyncio.DatagramProtocol):
         """Queue PCM for talkback; Speex frames are serialized on one task chain."""
         if not self._talkback or self._codec is None or self._fmt is None:
             return
+        # Mark mic activity before encode so gap-fill does not inject silence
+        # while Speex ffmpeg is still producing the RTP payload.
+        self._mic_queued_mono = time.monotonic()
         self._pcm.extend(pcm)
         name = self._codec.name.casefold()
         frame_bytes = self._fmt.frame_bytes
@@ -805,10 +841,10 @@ class SrtpMediaSession:
         Field regression (0.1.14–0.1.16): ``set_talkback(True)`` stopped silence
         before the HomeKit return-audio ffmpeg pipeline produced PCM, so TX
         stalled (~5 s at fixed tx_pkts) and the door never heard the phone.
-        Always gap-fill when no uplink packet was sent within ~18 ms.
+
+        Gap-fill uses ``needs_uplink_gap_fill`` so in-flight Speex encodes are
+        not interrupted with canned silence (which would mute/mix into speech).
         """
-        # Just under one 20 ms ptime so a late mic frame still wins the slot.
-        gap_fill_after = 0.018
         try:
             while not self._ending:
                 session = self.negotiated
@@ -820,8 +856,8 @@ class SrtpMediaSession:
                 ):
                     if not self.talkback_enabled:
                         await self.audio.send_silence()
-                    elif self.audio.tx_gap_seconds() >= gap_fill_after:
-                        # Talkback armed but no mic frame this ptime — keep TX alive.
+                    elif self.audio.needs_uplink_gap_fill():
+                        # Talkback armed but no mic ready this ptime — keep TX alive.
                         await self.audio.send_silence(force=True)
                 await asyncio.sleep(0.02)
         except asyncio.CancelledError:
