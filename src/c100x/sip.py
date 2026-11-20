@@ -478,9 +478,17 @@ class SipClient:
         await self._send_ack(dialog)
         return response.body
 
-    async def end_monitoring(self) -> None:
-        """Terminate the active monitoring dialog, if any."""
-        dialog, self._dialog = self._dialog, None
+    async def end_monitoring(self, dialog: SipDialog | None = None) -> None:
+        """Terminate ``dialog``, or the active monitoring dialog when omitted.
+
+        Passing an explicit dialog BYEs that dialog only. If it is still the
+        active ``_dialog``, clear it; otherwise leave a newer session's dialog
+        alone (failed-start cleanup must not hang up a replacement call).
+        """
+        if dialog is None:
+            dialog, self._dialog = self._dialog, None
+        elif self._dialog is dialog:
+            self._dialog = None
         if dialog is None or self._writer is None:
             return
         dialog.local_sequence += 1

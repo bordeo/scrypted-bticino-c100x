@@ -489,68 +489,87 @@ class SrtpMediaSession:
         self.audio_reject_reason = None
         self.last_answer_redacted = None
         self._claim_call_end_callback()
+        owned_dialog = None
         audio_sockets, audio_port = await asyncio.to_thread(reserve_even_pair)
         video_sockets, video_port = await asyncio.to_thread(reserve_even_pair)
-        try:
-            mappings = await asyncio.to_thread(
-                discover_mappings, audio_sockets + video_sockets
-            )
-        except StunError as err:
-            for reserved in audio_sockets + video_sockets:
-                reserved.close()
-            raise MediaSessionError(str(err)) from err
-        except Exception:
-            for reserved in audio_sockets + video_sockets:
-                reserved.close()
-            raise
-        public_addresses = {item[0] for item in mappings}
-        if len(public_addresses) != 1:
-            for reserved in audio_sockets + video_sockets:
-                reserved.close()
-            raise MediaSessionError("STUN returned inconsistent public media addresses")
-        address = public_addresses.pop()
-        loop = asyncio.get_running_loop()
-        try:
-            _audio_transport, audio_proto = await loop.create_datagram_endpoint(
-                lambda: _MediaRtpProtocol(
-                    "audio",
-                    self._dispatch_rtp,
-                    on_first_media=lambda: _LOGGER.debug("inbound audio RTP"),
-                ),
-                sock=audio_sockets[0],
-            )
-            audio_rtcp, _ = await loop.create_datagram_endpoint(
-                _StunResponderProtocol, sock=audio_sockets[1]
-            )
-            _video_transport, video_proto = await loop.create_datagram_endpoint(
-                lambda: _MediaRtpProtocol("video", self._dispatch_rtp),
-                sock=video_sockets[0],
-            )
-            video_rtcp, _ = await loop.create_datagram_endpoint(
-                _StunResponderProtocol, sock=video_sockets[1]
-            )
-        except OSError as err:
+
+        def _close_reserved() -> None:
             for reserved in audio_sockets + video_sockets:
                 with contextlib.suppress(OSError):
                     reserved.close()
-            raise MediaSessionError("RTP socket activation failed") from err
 
-        self.audio = audio_proto
-        self.video = video_proto
-        self._audio_rtcp = audio_rtcp
-        self._video_rtcp = video_rtcp
-        offer = build_monitoring_offer(
-            address=address,
-            audio_port=audio_port,
-            video_port=video_port,
-            device_address=device_address,
-            advertised_audio_port=mappings[0][1],
-            advertised_audio_rtcp_port=mappings[1][1],
-            advertised_video_port=mappings[2][1],
-            advertised_video_rtcp_port=mappings[3][1],
-        )
         try:
+            if self._discarded:
+                _close_reserved()
+                raise MediaSessionError("Media session was ended")
+            try:
+                mappings = await asyncio.to_thread(
+                    discover_mappings, audio_sockets + video_sockets
+                )
+            except StunError as err:
+                _close_reserved()
+                raise MediaSessionError(str(err)) from err
+            except Exception:
+                _close_reserved()
+                raise
+            if self._discarded:
+                _close_reserved()
+                raise MediaSessionError("Media session was ended")
+            public_addresses = {item[0] for item in mappings}
+            if len(public_addresses) != 1:
+                _close_reserved()
+                raise MediaSessionError("STUN returned inconsistent public media addresses")
+            address = public_addresses.pop()
+            loop = asyncio.get_running_loop()
+            try:
+                _audio_transport, audio_proto = await loop.create_datagram_endpoint(
+                    lambda: _MediaRtpProtocol(
+                        "audio",
+                        self._dispatch_rtp,
+                        on_first_media=lambda: _LOGGER.debug("inbound audio RTP"),
+                    ),
+                    sock=audio_sockets[0],
+                )
+                audio_rtcp, _ = await loop.create_datagram_endpoint(
+                    _StunResponderProtocol, sock=audio_sockets[1]
+                )
+                _video_transport, video_proto = await loop.create_datagram_endpoint(
+                    lambda: _MediaRtpProtocol("video", self._dispatch_rtp),
+                    sock=video_sockets[0],
+                )
+                video_rtcp, _ = await loop.create_datagram_endpoint(
+                    _StunResponderProtocol, sock=video_sockets[1]
+                )
+            except OSError as err:
+                _close_reserved()
+                raise MediaSessionError("RTP socket activation failed") from err
+
+            if self._discarded:
+                audio_proto.close()
+                video_proto.close()
+                audio_rtcp.close()
+                video_rtcp.close()
+                raise MediaSessionError("Media session was ended")
+
+            self.audio = audio_proto
+            self.video = video_proto
+            self._audio_rtcp = audio_rtcp
+            self._video_rtcp = video_rtcp
+            offer = build_monitoring_offer(
+                address=address,
+                audio_port=audio_port,
+                video_port=video_port,
+                device_address=device_address,
+                advertised_audio_port=mappings[0][1],
+                advertised_audio_rtcp_port=mappings[1][1],
+                advertised_video_port=mappings[2][1],
+                advertised_video_rtcp_port=mappings[3][1],
+            )
+            # Abort before INVITE so a finished end() during STUN/sockets does
+            # not occupy the door's single monitoring slot.
+            self._ensure_not_discarded()
             answer = await self.sip.start_monitoring(offer.sdp)
+            owned_dialog = self.sip._dialog
             # ``_ending`` clears when teardown finishes, so also require live
             # sockets / not-discarded (HomeKit reconnect during INVITE/486).
             self._ensure_not_discarded()
@@ -592,8 +611,12 @@ class SrtpMediaSession:
             return session
         except Exception:
             # Failed-start cleanup must not set ``_discarded`` — 486 retries
-            # call start() again on the same object.
-            await self._teardown(send_bye=True, discard=False)
+            # call start() again on the same object. BYE only the dialog this
+            # start() created so a newer HomeKit session's dialog survives.
+            await self._teardown(send_bye=False, discard=False)
+            if owned_dialog is not None:
+                with contextlib.suppress(Exception):
+                    await self.sip.end_monitoring(owned_dialog)
             raise
 
     async def end(self) -> None:
