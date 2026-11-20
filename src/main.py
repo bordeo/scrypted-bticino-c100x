@@ -370,9 +370,10 @@ class C100XDoorbell(
 
     async def getVideoStreamOptions(self) -> list[ResponseMediaStreamOptions]:
         # Prefer Opus (official Door Entry offer); Scrypted/HomeKit remux as needed.
-        # When door-audio gain is configured we re-encode Opus ourselves for RTSP.
+        # Only claim Opus from the gain path when the transcoder is actually running
+        # (setting alone can fall back to Speex passthrough if ffmpeg fails).
         audio: dict[str, Any] = {"codec": "opus", "sampleRate": 48000}
-        if self._door_audio_gain_db() > 0:
+        if self._audio_gain and self._audio_gain.active:
             audio = {"codec": "opus", "sampleRate": 48000}
         elif self._media and self._media.active:
             codec = self._media.selected_audio_codec()
@@ -561,13 +562,13 @@ class C100XDoorbell(
                 media.negotiated if media is not None else None
             )
             # Default to Opus (official offer preference) before negotiation.
+            # DESCRIBE waits for monitoring+gain start (on_describe_ready), so once
+            # ready the branch below matches what _on_plain_rtp actually sends.
             audio_pt = 96
             audio_rtpmap = "opus/48000/2"
             audio_fmtp = "a=fmtp:96 useinbandfec=1"
-            # Gain path always re-encodes to Opus PT 96 — advertise that as soon
-            # as the setting is on, not only after the transcoder finishes starting
-            # (DESCRIBE must not lock Speex/pt=98 then receive Opus/pt=96).
-            if self._door_audio_gain_db() > 0:
+            if self._audio_gain and self._audio_gain.active:
+                # Gain transcoder emits Opus PT 96 (same as this default).
                 audio_pt = DoorAudioGainTranscoder.OUTPUT_PAYLOAD_TYPE
                 audio_rtpmap = DoorAudioGainTranscoder.OUTPUT_RTPMAP
                 audio_fmtp = f"a=fmtp:{audio_pt} useinbandfec=1"
@@ -666,6 +667,11 @@ class C100XDoorbell(
                 await transcoder.close()
             return
         if not transcoder.active:
+            # Keep RTSP SDP on the negotiated codec (passthrough); do not claim Opus.
+            self.print(
+                f"Door audio gain +{gain_db} dB unavailable — "
+                "RTSP will passthrough negotiated audio"
+            )
             return
         # Teardown may have run while ffmpeg was starting — do not orphan it.
         if self._media is None or self._rtsp is None:
