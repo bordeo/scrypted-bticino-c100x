@@ -80,6 +80,55 @@ def test_parse_answer_port_zero_yields_none_audio() -> None:
 
 
 @pytest.mark.asyncio
+async def test_start_aborts_when_discarded_during_invite(monkeypatch) -> None:
+    """end() that finishes during INVITE must not configure closed sockets."""
+    import c100x.srtp_media as srtp_media
+
+    real_reserve = srtp_media.reserve_even_pair
+
+    class FakeSip:
+        on_call_end = None
+        _dialog = None
+
+        async def start_monitoring(self, offer_sdp: str) -> bytes:
+            # Simulate HomeKit teardown completing while INVITE is in flight.
+            await media.end()
+            audio_key, video_key = _keys()
+            return (
+                "v=0\r\n"
+                "o=- 1 1 IN IP4 198.51.100.9\r\n"
+                "c=IN IP4 198.51.100.9\r\n"
+                "t=0 0\r\n"
+                "m=audio 6000 RTP/SAVP 8\r\n"
+                "a=rtpmap:8 PCMA/8000\r\n"
+                "a=sendrecv\r\n"
+                f"a=crypto:1 {SRTP_SUITE} inline:{audio_key}\r\n"
+                "m=video 6002 RTP/SAVP 96\r\n"
+                "a=rtpmap:96 H264/90000\r\n"
+                "a=sendonly\r\n"
+                f"a=crypto:1 {SRTP_SUITE} inline:{video_key}\r\n"
+            ).encode()
+
+        async def end_monitoring(self) -> None:
+            return None
+
+    media = SrtpMediaSession(FakeSip())  # type: ignore[arg-type]
+    monkeypatch.setattr(
+        srtp_media, "reserve_even_pair", lambda bind_host="0.0.0.0": real_reserve("127.0.0.1")
+    )
+    monkeypatch.setattr(
+        srtp_media,
+        "discover_mappings",
+        lambda sockets: tuple(("203.0.113.10", 50000 + i) for i in range(len(sockets))),
+    )
+
+    with pytest.raises(MediaSessionError, match="was ended"):
+        await media.start("eu-1")
+    assert media.negotiated is None
+    assert media._discarded is True
+
+
+@pytest.mark.asyncio
 async def test_set_talkback_reports_missing_audio_reason() -> None:
     class FakeSip:
         on_call_end = None

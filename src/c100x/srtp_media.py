@@ -340,6 +340,9 @@ class SrtpMediaSession:
         self._first_video = asyncio.Event()
         self._last_packet = 0.0
         self._ending = False
+        # Sticky: set by end()/remote_ended so a finished teardown cannot be
+        # mistaken for a still-live session (``_ending`` clears in finally).
+        self._discarded = False
         self._teardown_done = asyncio.Event()
         self._teardown_done.set()
         self._last_keyframe: bytes | None = None
@@ -348,7 +351,7 @@ class SrtpMediaSession:
 
     @property
     def active(self) -> bool:
-        return self.negotiated is not None and not self._ending
+        return self.negotiated is not None and not self._ending and not self._discarded
 
     @property
     def last_keyframe(self) -> bytes | None:
@@ -381,11 +384,16 @@ class SrtpMediaSession:
             if asyncio.iscoroutine(result):
                 asyncio.create_task(result)
 
+    def _ensure_not_discarded(self) -> None:
+        if self._discarded or self.audio is None or self.video is None:
+            raise MediaSessionError("Media session was ended")
+
     async def start(self, device_address: str) -> NegotiatedSession:
         # Never clobber an in-flight teardown's event (Bugbot): waiters must
         # observe the same Event that _teardown will set.
         if self._ending:
             await self._teardown_done.wait()
+        if self._discarded:
             raise MediaSessionError("Media session was ended")
         if self.negotiated:
             raise MediaSessionError("A media session is already active")
@@ -455,13 +463,15 @@ class SrtpMediaSession:
         )
         try:
             answer = await self.sip.start_monitoring(offer.sdp)
-            if self._ending:
-                raise MediaSessionError("Media session was ended")
+            # ``_ending`` clears when teardown finishes, so also require live
+            # sockets / not-discarded (HomeKit reconnect during INVITE/486).
+            self._ensure_not_discarded()
             # Field diagnosis: keep the door's answer with SDES keys stripped.
             self.last_answer_redacted = redact_sdp(answer).rstrip()
             _LOGGER.info("Monitoring SDP answer (redacted):\n%s", self.last_answer_redacted)
             audio_explain = explain_answer_audio(answer)
             session = parse_answer(answer, offer)
+            self._ensure_not_discarded()
             self.negotiated = session
             if session.audio is None:
                 self.audio_reject_reason = audio_explain
@@ -492,18 +502,20 @@ class SrtpMediaSession:
             self._keepalive = asyncio.create_task(self._audio_keepalive())
             return session
         except Exception:
-            await self._teardown(send_bye=True)
+            # Failed-start cleanup must not set ``_discarded`` — 486 retries
+            # call start() again on the same object.
+            await self._teardown(send_bye=True, discard=False)
             raise
 
     async def end(self) -> None:
-        await self._teardown(send_bye=True)
+        await self._teardown(send_bye=True, discard=True)
 
     async def remote_ended(self) -> None:
-        await self._teardown(send_bye=False)
+        await self._teardown(send_bye=False, discard=True)
 
     def talkback_block_reason(self) -> str | None:
         """Return why talkback cannot start, or None when it can."""
-        if self.negotiated is None or self._ending:
+        if self.negotiated is None or self._ending or self._discarded:
             return "no active monitoring call"
         if self.negotiated.audio is None:
             detail = self.audio_reject_reason or "answer omitted usable audio"
@@ -573,9 +585,11 @@ class SrtpMediaSession:
         except asyncio.CancelledError:
             raise
 
-    async def _teardown(self, *, send_bye: bool) -> None:
+    async def _teardown(self, *, send_bye: bool, discard: bool = True) -> None:
         # Wait for an in-flight teardown instead of returning early: overlapping
         # end() calls from on_connect / on_teardown must not race socket closes.
+        if discard:
+            self._discarded = True
         if self._ending:
             await self._teardown_done.wait()
             return
