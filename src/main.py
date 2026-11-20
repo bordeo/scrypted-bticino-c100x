@@ -42,6 +42,8 @@ from c100x.const import (
     CONF_HOME_ID,
     CONF_PASSWORD,
     MEDIA_IDLE_SECONDS,
+    MONITOR_BUSY_RETRY_INTERVAL,
+    MONITOR_BUSY_RETRY_SECONDS,
     RING_ACTIVE_SECONDS,
 )
 from c100x.models import SipAccount
@@ -505,7 +507,22 @@ class C100XDoorbell(
                 try:
                     self.print("Starting monitoring call")
                     device_address = await self.plugin.monitoring_device_address()
-                    await media.start(device_address)
+                    deadline = asyncio.get_running_loop().time() + MONITOR_BUSY_RETRY_SECONDS
+                    while True:
+                        try:
+                            await media.start(device_address)
+                            break
+                        except SipError as err:
+                            # 486: the door already has a monitoring call (for example
+                            # Home Assistant's, which ends ~10 s after its last viewer).
+                            busy = "SIP status 486" in str(err)
+                            now = asyncio.get_running_loop().time()
+                            if not busy or session.closed or now >= deadline:
+                                raise
+                            self.print("Door busy (486); retrying monitoring call")
+                            await asyncio.sleep(MONITOR_BUSY_RETRY_INTERVAL)
+                            if session.closed:
+                                return
                     if session.closed:
                         await media.end()
                         return

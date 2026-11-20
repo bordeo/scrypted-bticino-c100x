@@ -64,3 +64,9 @@ STUN_XOR_MAPPED_ADDRESS = 0x0020
 
 MEDIA_IDLE_SECONDS = 30
 RING_DECLINE_DELAY_SECONDS = 2
+
+# A 486 on a monitoring INVITE means the door already streams to another client
+# (HA keeps its call ~10 s after the last viewer). Retry briefly, within
+# HomeKit's patience, instead of failing the view immediately.
+MONITOR_BUSY_RETRY_SECONDS = 15
+MONITOR_BUSY_RETRY_INTERVAL = 2.0

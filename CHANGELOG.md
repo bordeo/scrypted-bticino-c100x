@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.9 — unreleased
+
+- Retry a monitoring INVITE for up to 15 s (every 2 s) when the door answers `486 Busy Here`, instead of failing the HomeKit view at once. The door allows one monitoring call; Home Assistant keeps its call about 10 s after its last viewer leaves.
+
 ## 0.1.8 — unreleased
 
 - Fix Casa/HomeKit video stopping after a provider settings save (for example ticking "Enable talkback"): the save reconnected SIP, but the reused RTSP server kept a media session bound to the closed SipClient, so every view failed with `SIP connection is not open`. Media sessions are now created per RTSP client from the SipClient current at connect time, and the RTSP server, talkback and media are dropped whenever SIP is torn down (settings save or supervisor reconnect).
