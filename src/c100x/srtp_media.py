@@ -343,7 +343,8 @@ class SrtpMediaSession:
         self._teardown_done = asyncio.Event()
         self._teardown_done.set()
         self._last_keyframe: bytes | None = None
-        self.sip.on_call_end = self.remote_ended
+        # Do not claim sip.on_call_end in __init__: a reconnect may construct this
+        # object before the previous session's BYE finishes. start() installs it.
 
     @property
     def active(self) -> bool:
@@ -352,6 +353,13 @@ class SrtpMediaSession:
     @property
     def last_keyframe(self) -> bytes | None:
         return self._last_keyframe
+
+    def _claim_call_end_callback(self) -> None:
+        self.sip.on_call_end = self.remote_ended
+
+    def _release_call_end_callback(self) -> None:
+        if self.sip.on_call_end == self.remote_ended:
+            self.sip.on_call_end = None
 
     def _dispatch_rtp(self, packet: bytes, kind: str) -> None:
         self._last_packet = time.monotonic()
@@ -374,14 +382,17 @@ class SrtpMediaSession:
                 asyncio.create_task(result)
 
     async def start(self, device_address: str) -> NegotiatedSession:
+        # Never clobber an in-flight teardown's event (Bugbot): waiters must
+        # observe the same Event that _teardown will set.
+        if self._ending:
+            await self._teardown_done.wait()
+            raise MediaSessionError("Media session was ended")
         if self.negotiated:
             raise MediaSessionError("A media session is already active")
-        self._ending = False
-        self._teardown_done = asyncio.Event()
-        self._teardown_done.set()
         self.talkback_enabled = False
         self.audio_reject_reason = None
         self.last_answer_redacted = None
+        self._claim_call_end_callback()
         audio_sockets, audio_port = await asyncio.to_thread(reserve_even_pair)
         video_sockets, video_port = await asyncio.to_thread(reserve_even_pair)
         try:
@@ -444,6 +455,8 @@ class SrtpMediaSession:
         )
         try:
             answer = await self.sip.start_monitoring(offer.sdp)
+            if self._ending:
+                raise MediaSessionError("Media session was ended")
             # Field diagnosis: keep the door's answer with SDES keys stripped.
             self.last_answer_redacted = redact_sdp(answer).rstrip()
             _LOGGER.info("Monitoring SDP answer (redacted):\n%s", self.last_answer_redacted)
@@ -593,6 +606,7 @@ class SrtpMediaSession:
             if send_bye:
                 with contextlib.suppress(Exception):
                     await self.sip.end_monitoring()
+            self._release_call_end_callback()
             self.negotiated = None
             self.audio_reject_reason = None
             self.last_answer_redacted = None

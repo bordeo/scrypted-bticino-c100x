@@ -484,7 +484,7 @@ class C100XDoorbell(
         # One SrtpMediaSession per RTSP client, bound to the SipClient that is
         # current *at connect time*. The server can outlive a SIP reconnect
         # (settings save, supervisor), so it must never capture a SipClient.
-        session_media: dict[int, SrtpMediaSession] = {}
+        session_media: dict[int, SrtpMediaSession | None] = {}
         session_ready: dict[int, asyncio.Event] = {}
 
         async def on_connect(session: RtspSession) -> None:
@@ -493,40 +493,51 @@ class C100XDoorbell(
             # (Bugbot) exceeded that on HomeKit reconnect during a live view.
             # DEVADDR must be the visible external-unit module id (HA 0.3.3),
             # not the gateway id — wrong DEVADDR yields SIP 486 Busy Here.
-            # HA establishes monitoring before exposing playback; we mirror that
-            # by gating DESCRIBE on the ready event (OPTIONS stays instant).
+            # Construct SrtpMediaSession only after previous BYE so we do not
+            # steal sip.on_call_end from the session that still owns _dialog.
 
             sip = self.plugin.sip
             if sip is None or not sip.registered:
                 self.print("Monitoring call failed: SIP is not registered yet")
                 await session.close()
                 return
-            media = SrtpMediaSession(
-                sip,
-                on_plain_rtp=self._on_plain_rtp,
-                on_keyframe=lambda nal: asyncio.create_task(self._cache_keyframe_jpeg(nal)),
-            )
             ready = asyncio.Event()
-            session_media[id(session)] = media
+            session_media[id(session)] = None
             session_ready[id(session)] = ready
             self._logged_first_video = False
             self._logged_first_audio = False
 
             async def _start_monitoring() -> None:
+                media: SrtpMediaSession | None = None
                 try:
                     # Previous call teardown (BYE) happens here — not before OPTIONS.
                     async with self._media_lock:
                         await self._end_media_unlocked()
                         if session.closed:
                             return
+                        media = SrtpMediaSession(
+                            sip,
+                            on_plain_rtp=self._on_plain_rtp,
+                            on_keyframe=lambda nal: asyncio.create_task(
+                                self._cache_keyframe_jpeg(nal)
+                            ),
+                        )
+                        session_media[id(session)] = media
                         self._media = media
                     self.print("Starting monitoring call")
                     device_address = await self.plugin.monitoring_device_address()
                     deadline = asyncio.get_running_loop().time() + MONITOR_BUSY_RETRY_SECONDS
                     while True:
+                        if session.closed or media is None:
+                            return
                         try:
                             session_neg = await media.start(device_address)
                             break
+                        except MediaSessionError as err:
+                            # Ended underneath us (RTSP teardown during 486 retry).
+                            if "was ended" in str(err).casefold() or session.closed:
+                                return
+                            raise
                         except SipError as err:
                             # 486: the door already has a monitoring call (for example
                             # Home Assistant's, which ends ~10 s after its last viewer).
@@ -567,10 +578,11 @@ class C100XDoorbell(
             ready = session_ready.get(id(session))
             if ready is None:
                 return
-            # Wait for INVITE/answer so DESCRIBE can omit a dead audio track.
-            # Cap wait so a stuck INVITE cannot hang the RTSP client forever.
+            # Best-effort wait for INVITE so DESCRIBE can use the negotiated
+            # codec. Audio is always advertised (default PCMA) even on timeout
+            # so a slow BYE/486 window cannot leave HomeKit without an audio track.
             with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(ready.wait(), timeout=MONITOR_BUSY_RETRY_SECONDS + 5)
+                await asyncio.wait_for(ready.wait(), timeout=12.0)
 
         async def on_teardown(session: RtspSession) -> None:
             session_ready.pop(id(session), None)
@@ -586,36 +598,38 @@ class C100XDoorbell(
 
         def sdp_builder(session: RtspSession) -> str:
             media = session_media.get(id(session))
-            negotiated: NegotiatedSession | None = media.negotiated if media else None
-            lines = [
-                "v=0",
-                "o=- 0 0 IN IP4 127.0.0.1",
-                "s=BTicino C100X",
-                "c=IN IP4 127.0.0.1",
-                "t=0 0",
-                "m=video 0 RTP/AVP 96",
-                "a=rtpmap:96 H264/90000",
-                "a=fmtp:96 packetization-mode=1;profile-level-id=42e01f",
-                "a=control:trackID=0",
-                "a=sendonly",
-            ]
-            # Only advertise RTSP audio when the door negotiated it — otherwise
-            # HomeKit/ffmpeg SETs UP pcm_alaw and then writes nothing.
+            negotiated: NegotiatedSession | None = (
+                media.negotiated if media is not None else None
+            )
+            audio_pt = 8
+            audio_name = "PCMA"
             if negotiated and negotiated.audio:
                 codec = negotiated.audio.codec({"pcma", "pcmu"})
                 if codec:
                     audio_pt = codec.payload_type
                     audio_name = codec.name.upper()
-                    lines.extend(
-                        [
-                            f"m=audio 0 RTP/AVP {audio_pt}",
-                            f"a=rtpmap:{audio_pt} {audio_name}/8000",
-                            "a=control:trackID=1",
-                            "a=sendonly",
-                        ]
-                    )
-            lines.append("")
-            return "\r\n".join(lines)
+            # Always advertise audio (HA exposes playback only after monitoring,
+            # but Scrypted's DESCRIBE can race INVITE). Prefer negotiated codec
+            # when ready; otherwise default PCMA so HomeKit still SETs UP talkback.
+            return "\r\n".join(
+                [
+                    "v=0",
+                    "o=- 0 0 IN IP4 127.0.0.1",
+                    "s=BTicino C100X",
+                    "c=IN IP4 127.0.0.1",
+                    "t=0 0",
+                    "m=video 0 RTP/AVP 96",
+                    "a=rtpmap:96 H264/90000",
+                    "a=fmtp:96 packetization-mode=1;profile-level-id=42e01f",
+                    "a=control:trackID=0",
+                    "a=sendonly",
+                    f"m=audio 0 RTP/AVP {audio_pt}",
+                    f"a=rtpmap:{audio_pt} {audio_name}/8000",
+                    "a=control:trackID=1",
+                    "a=sendonly",
+                    "",
+                ]
+            )
 
         server = RtspServer(
             on_connect=on_connect,
