@@ -6,7 +6,18 @@ from types import SimpleNamespace
 
 import pytest
 
-from c100x.audio_codec import OpusEncoder, talkback_format_for
+from c100x.audio_codec import (
+    SPEEX_8000_SILENCE_FRAME,
+    OpusEncoder,
+    speex_silence_frame,
+    talkback_format_for,
+)
+
+
+def test_speex_8000_silence_frame_canned() -> None:
+    assert speex_silence_frame(8000) == SPEEX_8000_SILENCE_FRAME
+    assert len(SPEEX_8000_SILENCE_FRAME) == 38
+    assert speex_silence_frame(16000) is None
 
 
 def test_talkback_format_opus_speex_g711() -> None:

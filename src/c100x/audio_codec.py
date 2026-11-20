@@ -12,6 +12,20 @@ from typing import Any
 
 _LOGGER = logging.getLogger(__name__)
 
+# Steady-state narrowband Speex (8000 Hz, 20 ms) silence payload captured from
+# libspeex via Ogg (no RTP header). Used for uplink keepalive so the door opens
+# downlink audio without depending on a live ffmpeg RTP muxer.
+SPEEX_8000_SILENCE_FRAME = bytes.fromhex(
+    "2e9d1b9a2002017fffffffffff8100bfffffffffffc0805fffffffffffe0402ffffffffffff7"
+)
+
+
+def speex_silence_frame(clock_rate: int) -> bytes | None:
+    """Return a canned Speex silence payload for ``clock_rate``, if known."""
+    if int(clock_rate) == 8000:
+        return SPEEX_8000_SILENCE_FRAME
+    return None
+
 
 @dataclass(frozen=True, slots=True)
 class TalkbackFormat:

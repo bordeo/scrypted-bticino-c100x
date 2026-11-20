@@ -45,7 +45,7 @@ SIP_KEEPALIVE_PING = b"\r\n\r\n"
 SIP_KEEPALIVE_PONG = b"\r\n"
 # Short reconnect backoff after refresh/socket failure (seconds).
 SIP_RECONNECT_BACKOFF = (1, 2, 5, 30)
-SIP_USER_AGENT = "scrypted-bticino-c100x/0.1"
+SIP_USER_AGENT = "scrypted-bticino-c100x/0.1.12"
 SIP_CLIENT_NAME = "Scrypted"
 
 # Certificate profile used by the official Classe 100X application.
@@ -62,7 +62,13 @@ STUN_BINDING_REQUEST = 0x0001
 STUN_BINDING_SUCCESS = 0x0101
 STUN_XOR_MAPPED_ADDRESS = 0x0020
 
-MEDIA_IDLE_SECONDS = 30
+# RTSP PLAY idle: HomeKit/ffmpeg often send no RTSP requests after PLAY while
+# RTP flows. 30 s killed live views (~35 s TimeoutError). Prefer GET_PARAMETER
+# keepalives + RTP activity; this is the backstop only.
+MEDIA_IDLE_SECONDS = 300
+# Log door-side RTP rx/tx counters every N seconds for the first M seconds.
+RTP_COUNTER_LOG_INTERVAL = 5.0
+RTP_COUNTER_LOG_WINDOW = 30.0
 RING_DECLINE_DELAY_SECONDS = 2
 
 # A 486 on a monitoring INVITE means the door already streams to another client

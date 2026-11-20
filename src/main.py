@@ -32,6 +32,7 @@ from scrypted_sdk.types import (
 )
 
 from c100x.api import ApiError, LegrandApi, log_api_failure
+from c100x.assets import load_citofono_placeholder
 from c100x.auth import AuthenticationError, C100XAuth, log_auth_failure
 from c100x.certificate import certificate_expiry, provision_certificate
 from c100x.const import (
@@ -70,169 +71,7 @@ _SECRET_KEYS = frozenset(
     }
 )
 
-PLACEHOLDER_JPEG = bytes(
-    [
-        0xFF,
-        0xD8,
-        0xFF,
-        0xE0,
-        0x00,
-        0x10,
-        0x4A,
-        0x46,
-        0x49,
-        0x46,
-        0x00,
-        0x01,
-        0x01,
-        0x00,
-        0x00,
-        0x01,
-        0x00,
-        0x01,
-        0x00,
-        0x00,
-        0xFF,
-        0xDB,
-        0x00,
-        0x43,
-        0x00,
-        0x08,
-        0x06,
-        0x06,
-        0x07,
-        0x06,
-        0x05,
-        0x08,
-        0x07,
-        0x07,
-        0x07,
-        0x09,
-        0x09,
-        0x08,
-        0x0A,
-        0x0C,
-        0x14,
-        0x0D,
-        0x0C,
-        0x0B,
-        0x0B,
-        0x0C,
-        0x19,
-        0x12,
-        0x13,
-        0x0F,
-        0x14,
-        0x1D,
-        0x1A,
-        0x1F,
-        0x1E,
-        0x1D,
-        0x1A,
-        0x1C,
-        0x1C,
-        0x20,
-        0x24,
-        0x2E,
-        0x27,
-        0x20,
-        0x22,
-        0x2C,
-        0x23,
-        0x1C,
-        0x1C,
-        0x28,
-        0x37,
-        0x29,
-        0x2C,
-        0x30,
-        0x31,
-        0x34,
-        0x34,
-        0x34,
-        0x1F,
-        0x27,
-        0x39,
-        0x3D,
-        0x38,
-        0x32,
-        0x3C,
-        0x2E,
-        0x33,
-        0x34,
-        0x32,
-        0xFF,
-        0xC0,
-        0x00,
-        0x0B,
-        0x08,
-        0x00,
-        0x01,
-        0x00,
-        0x01,
-        0x01,
-        0x01,
-        0x11,
-        0x00,
-        0xFF,
-        0xC4,
-        0x00,
-        0x14,
-        0x00,
-        0x01,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x03,
-        0xFF,
-        0xC4,
-        0x00,
-        0x14,
-        0x10,
-        0x01,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0xFF,
-        0xDA,
-        0x00,
-        0x08,
-        0x01,
-        0x01,
-        0x00,
-        0x00,
-        0x3F,
-        0x00,
-        0x7F,
-        0xFF,
-        0xD9,
-    ]
-)
+PLACEHOLDER_JPEG = load_citofono_placeholder()
 
 
 def _json_get(storage, key: str, default=None):
@@ -280,7 +119,10 @@ class C100XDoorbell(
     # --- Settings ---------------------------------------------------------
 
     def _talkback_enabled(self) -> bool:
-        return bool(_json_get(self.plugin.storage, CONF_ENABLE_TALKBACK, False))
+        try:
+            return bool(_json_get(self.plugin.storage, CONF_ENABLE_TALKBACK, False))
+        except Exception:
+            return False
 
     async def getSettings(self) -> list[Setting]:
         settings: list[Setting] = [
@@ -388,10 +230,20 @@ class C100XDoorbell(
     # --- Camera / snapshots -----------------------------------------------
 
     async def getPictureOptions(self):
-        return []
+        # Advertise a snapshot so Casa/HomeKit can fill the tile without a SIP call.
+        return [
+            {
+                "id": "default",
+                "name": "Citofono",
+                "picture": {"width": 1280, "height": 720},
+            }
+        ]
 
     async def takePicture(self, options=None) -> MediaObject:
-        """Return a cached keyframe JPEG. Never places a monitoring call."""
+        """Return a recent keyframe JPEG, else the bundled Citofono placeholder.
+
+        Never places a monitoring SIP call for snapshots.
+        """
         self._warn_prebuffer()
         jpeg = self._last_jpeg or PLACEHOLDER_JPEG
         return await scrypted_sdk.mediaManager.createMediaObject(jpeg, "image/jpeg")
@@ -539,10 +391,15 @@ class C100XDoorbell(
                                 self._cache_keyframe_jpeg(nal)
                             ),
                             ffmpeg_path=ffmpeg_path,
+                            on_log=self.print,
                         )
                         session_media[id(session)] = media
                         self._media = media
-                    self.print("Starting monitoring call")
+                    talkback_on = self._talkback_enabled()
+                    self.print(
+                        "Starting monitoring call "
+                        f"(Intercom {'advertised' if talkback_on else 'OFF — enable talkback in settings'})"
+                    )
                     device_address = await self.plugin.monitoring_device_address()
                     deadline = asyncio.get_running_loop().time() + MONITOR_BUSY_RETRY_SECONDS
                     while True:
@@ -706,33 +563,54 @@ class C100XDoorbell(
     # --- Intercom / talkback ----------------------------------------------
 
     async def startIntercom(self, media: MediaObject) -> None:
+        self.print("startIntercom: entry")
         if not self._talkback_enabled():
+            self.print("startIntercom: refused — talkback disabled in settings")
             raise TalkbackError("Talkback is disabled; enable it in device settings")
         if not self._media or not self._media.active:
+            self.print("startIntercom: refused — no active viewing call")
             raise TalkbackError("Talkback requires an active viewing call")
         block = self._media.talkback_block_reason()
         if block is not None:
             message = f"Talkback unavailable: {block}"
-            self.print(message)
+            self.print(f"startIntercom: refused — {message}")
             raise TalkbackError(message)
-        ffmpeg_input = await scrypted_sdk.mediaManager.convertMediaObjectToJSON(
-            media, ScryptedMimeTypes.FFmpegInput.value
+        codec = self._media.selected_audio_codec()
+        self.print(
+            "startIntercom: active call "
+            f"(codec={codec.name if codec else '?'}/"
+            f"{codec.clock_rate if codec else '?'})"
         )
+        try:
+            ffmpeg_input = await scrypted_sdk.mediaManager.convertMediaObjectToJSON(
+                media, ScryptedMimeTypes.FFmpegInput.value
+            )
+        except Exception as err:
+            self.print(f"startIntercom: FFmpegInput convert failed: {type(err).__name__}: {err}")
+            raise
         if not isinstance(ffmpeg_input, dict):
+            self.print("startIntercom: refused — expected FFmpegInput JSON")
             raise TalkbackError("Expected FFmpegInput JSON for talkback")
         ffmpeg = await scrypted_sdk.mediaManager.getFFmpegPath()
-        pipeline = TalkbackPipeline(self._media)
+        pipeline = TalkbackPipeline(self._media, on_log=self.print)
         try:
             await pipeline.start(ffmpeg, ffmpeg_input)
         except MediaSessionError as err:
-            self.print(str(err))
+            self.print(f"startIntercom: MediaSessionError: {err}")
             raise TalkbackError(str(err)) from err
+        except TalkbackError as err:
+            self.print(f"startIntercom: TalkbackError: {err}")
+            raise
         self._talkback = pipeline
+        self.print("startIntercom: pipeline started")
 
     async def stopIntercom(self) -> None:
+        self.print("stopIntercom: entry")
         if self._talkback:
             await self._talkback.stop()
             self._talkback = None
+        else:
+            self.print("stopIntercom: no active pipeline")
 
 
 class C100XPlugin(

@@ -1,8 +1,9 @@
-"""Minimal one-client RTSP server (TCP interleaved) for Scrypted MediaStreamUrl.
+"""Minimal one-client RTSP server for Scrypted MediaStreamUrl.
 
-Supports OPTIONS / DESCRIBE / SETUP / PLAY / TEARDOWN. On client connect the
-caller places a monitoring INVITE; plain RTP is forwarded as interleaved
-channels. Only one session at a time.
+Supports OPTIONS / DESCRIBE / SETUP / PLAY / TEARDOWN / GET_PARAMETER.
+SETUP accepts TCP interleaved and UDP unicast (client_port). On client connect
+the caller places a monitoring INVITE; plain RTP is forwarded as interleaved
+TCP channels and/or UDP datagrams. Only one session at a time.
 """
 
 from __future__ import annotations
@@ -11,6 +12,8 @@ import asyncio
 import contextlib
 import logging
 import re
+import socket
+import time
 from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -21,6 +24,15 @@ OnConnect = Callable[["RtspSession"], Awaitable[None]]
 OnTeardown = Callable[["RtspSession"], Awaitable[None]]
 OnDescribeReady = Callable[["RtspSession"], Awaitable[None]]
 OnLog = Callable[[str], None]
+
+
+@dataclass(slots=True)
+class _UdpTrack:
+    """UDP destination for one media track (RTP + RTCP ports)."""
+
+    rtp_addr: tuple[str, int]
+    rtcp_addr: tuple[str, int] | None
+    sock: socket.socket
 
 
 @dataclass(slots=True)
@@ -36,6 +48,9 @@ class RtspSession:
     video_channel: int = 0
     audio_channel: int = 2
     closed: bool = False
+    last_activity: float = field(default_factory=time.monotonic)
+    video_udp: _UdpTrack | None = None
+    audio_udp: _UdpTrack | None = None
     _send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     @property
@@ -46,9 +61,30 @@ class RtspSession:
         except Exception:
             return "?"
 
-    async def send_rtp(self, packet: bytes, *, channel: int) -> None:
-        """Send one interleaved RTP packet ($ + channel + length + data)."""
+    @property
+    def peer_host(self) -> str:
+        try:
+            addr = self.writer.get_extra_info("peername")
+            if addr:
+                return str(addr[0])
+        except Exception:
+            pass
+        return "127.0.0.1"
+
+    def touch(self) -> None:
+        self.last_activity = time.monotonic()
+
+    async def send_rtp(self, packet: bytes, *, channel: int, kind: str) -> None:
+        """Send one RTP packet via UDP (if SETUP) or TCP interleaved."""
         if self.closed or not self.playing:
+            return
+        self.touch()
+        udp = self.video_udp if kind == "video" else self.audio_udp
+        if udp is not None:
+            with contextlib.suppress(OSError):
+                udp.sock.sendto(packet, udp.rtp_addr)
+            return
+        if channel < 0:
             return
         header = b"$" + bytes([channel & 0xFF]) + len(packet).to_bytes(2, "big")
         async with self._send_lock:
@@ -63,6 +99,12 @@ class RtspSession:
             return
         self.closed = True
         self.playing = False
+        for track in (self.video_udp, self.audio_udp):
+            if track is not None:
+                with contextlib.suppress(OSError):
+                    track.sock.close()
+        self.video_udp = None
+        self.audio_udp = None
         try:
             self.writer.close()
             await self.writer.wait_closed()
@@ -80,7 +122,7 @@ class RtspServer:
         on_teardown: OnTeardown | None = None,
         on_describe_ready: OnDescribeReady | None = None,
         sdp_builder: Callable[["RtspSession"], str] | None = None,
-        idle_seconds: float = 30.0,
+        idle_seconds: float = 300.0,
         on_log: OnLog | None = None,
     ) -> None:
         self.on_connect = on_connect
@@ -120,7 +162,7 @@ class RtspServer:
                 self._pending.clear()
                 return
             channel = session.video_channel if kind == "video" else session.audio_channel
-            await session.send_rtp(packet, channel=channel)
+            await session.send_rtp(packet, channel=channel, kind=kind)
 
     async def start(self) -> str:
 
@@ -153,7 +195,7 @@ class RtspServer:
                 self._pending.popleft()
             return
         channel = session.video_channel if kind == "video" else session.audio_channel
-        await session.send_rtp(packet, channel=channel)
+        await session.send_rtp(packet, channel=channel, kind=kind)
 
     async def _handle_client(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
@@ -196,26 +238,42 @@ class RtspServer:
 
     async def _serve(self, session: RtspSession) -> None:
         while not session.closed:
+            timeout = self.idle_seconds if session.playing else 60.0
+            if session.playing:
+                # Activity-based idle: RTP forward refreshes last_activity.
+                remaining = self.idle_seconds - (time.monotonic() - session.last_activity)
+                if remaining <= 0:
+                    _LOGGER.info("RTSP idle timeout; tearing down")
+                    raise TimeoutError("RTSP idle timeout")
+                timeout = max(1.0, min(timeout, remaining))
             try:
                 request = await asyncio.wait_for(
                     _read_rtsp_request(session.reader),
-                    timeout=self.idle_seconds if session.playing else 60.0,
+                    timeout=timeout,
                 )
             except TimeoutError as err:
                 if session.playing:
+                    # Re-check activity (RTP may have refreshed during wait).
+                    if time.monotonic() - session.last_activity < self.idle_seconds:
+                        continue
                     _LOGGER.info("RTSP idle timeout; tearing down")
-                    raise
+                    raise TimeoutError("RTSP idle timeout") from err
                 raise ConnectionError("RTSP handshake timeout") from err
             if request is None:
                 break
             method, url, headers, _body = request
             session.cseq = int(headers.get("cseq", "0"))
+            session.touch()
             if method == "OPTIONS":
                 await _respond(
                     session,
                     200,
                     "OK",
-                    extra={"Public": "OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN"},
+                    extra={
+                        "Public": (
+                            "OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN, GET_PARAMETER"
+                        )
+                    },
                 )
             elif method == "DESCRIBE":
                 if self.on_describe_ready:
@@ -233,60 +291,125 @@ class RtspServer:
                     },
                 )
             elif method == "SETUP":
-                transport = headers.get("transport", "")
-                transport_l = transport.lower()
-                # Only TCP interleaved is implemented. Scrypted's RtspClient
-                # (and HomeKit's ffmpeg pull) try UDP first and fall back to TCP
-                # only on RtspStatusError. A 200 with a TCP Transport for a UDP
-                # SETUP makes the client skip the fallback, so the player never
-                # receives RTP. Implementing real UDP RTP is not cheap/safe here;
-                # the two 461s before interleaved SETUP are expected and correct.
-                if "interleaved=" not in transport_l and "/tcp" not in transport_l:
-                    self._log("RTSP SETUP rejected: 461 Unsupported Transport")
-                    await _respond(session, 461, "Unsupported Transport")
-                    continue
-                channel = 0
-                match = re.search(r"interleaved=(\d+)(?:-(\d+))?", transport)
-                if match:
-                    channel = int(match.group(1))
-                if "trackID=1" in url or "track/audio" in url or "streamid=1" in url:
-                    session.audio_channel = channel
-                    track = "audio"
-                else:
-                    session.video_channel = channel
-                    track = "video"
-                reply_transport = (
-                    f"RTP/AVP/TCP;unicast;interleaved={channel}-{channel + 1};mode=play"
-                )
-                await _respond(
-                    session,
-                    200,
-                    "OK",
-                    extra={
-                        "Transport": reply_transport,
-                        "Session": session.session_id,
-                        "X-Track": track,
-                    },
-                )
+                await self._handle_setup(session, url, headers)
             elif method == "PLAY":
                 session.playing = True
+                session.touch()
                 await _respond(
                     session,
                     200,
                     "OK",
                     extra={
-                        "Session": session.session_id,
+                        "Session": f"{session.session_id};timeout={int(self.idle_seconds)}",
                         "RTP-Info": f"url={self.url}trackID=0,seq=0",
                     },
                 )
                 self._log("RTSP PLAY")
                 await self._flush_pending(session)
+            elif method in {"GET_PARAMETER", "SET_PARAMETER"}:
+                # HomeKit / ffmpeg keepalive; refresh activity and reply.
+                await _respond(
+                    session,
+                    200,
+                    "OK",
+                    extra={"Session": session.session_id},
+                )
             elif method == "TEARDOWN":
                 await _respond(session, 200, "OK", extra={"Session": session.session_id})
                 session.playing = False
                 break
             else:
                 await _respond(session, 501, "Not Implemented")
+
+    async def _handle_setup(
+        self, session: RtspSession, url: str, headers: dict[str, str]
+    ) -> None:
+        transport = headers.get("transport", "")
+        transport_l = transport.lower()
+        is_audio = "trackID=1" in url or "track/audio" in url or "streamid=1" in url
+        track = "audio" if is_audio else "video"
+
+        if "interleaved=" in transport_l or "/tcp" in transport_l:
+            channel = 0
+            match = re.search(r"interleaved=(\d+)(?:-(\d+))?", transport)
+            if match:
+                channel = int(match.group(1))
+            if is_audio:
+                session.audio_channel = channel
+                session.audio_udp = None
+            else:
+                session.video_channel = channel
+                session.video_udp = None
+            reply_transport = (
+                f"RTP/AVP/TCP;unicast;interleaved={channel}-{channel + 1};mode=play"
+            )
+            self._log(f"RTSP SETUP {track} TCP interleaved={channel}-{channel + 1}")
+            await _respond(
+                session,
+                200,
+                "OK",
+                extra={
+                    "Transport": reply_transport,
+                    "Session": session.session_id,
+                    "X-Track": track,
+                },
+            )
+            return
+
+        client_ports = re.search(r"client_port=(\d+)(?:-(\d+))?", transport_l)
+        if client_ports:
+            rtp_port = int(client_ports.group(1))
+            rtcp_port = int(client_ports.group(2) or rtp_port + 1)
+            host = session.peer_host
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setblocking(False)
+            try:
+                sock.bind((self.host, 0))
+            except OSError:
+                sock.close()
+                self._log(f"RTSP SETUP {track} UDP bind failed; 461")
+                await _respond(session, 461, "Unsupported Transport")
+                return
+            server_port = sock.getsockname()[1]
+            udp = _UdpTrack(
+                rtp_addr=(host, rtp_port),
+                rtcp_addr=(host, rtcp_port),
+                sock=sock,
+            )
+            if is_audio:
+                if session.audio_udp:
+                    with contextlib.suppress(OSError):
+                        session.audio_udp.sock.close()
+                session.audio_udp = udp
+                session.audio_channel = -1
+            else:
+                if session.video_udp:
+                    with contextlib.suppress(OSError):
+                        session.video_udp.sock.close()
+                session.video_udp = udp
+                session.video_channel = -1
+            reply_transport = (
+                f"RTP/AVP;unicast;client_port={rtp_port}-{rtcp_port};"
+                f"server_port={server_port}-{server_port + 1};mode=play"
+            )
+            self._log(
+                f"RTSP SETUP {track} UDP client_port={rtp_port}-{rtcp_port} "
+                f"server_port={server_port}"
+            )
+            await _respond(
+                session,
+                200,
+                "OK",
+                extra={
+                    "Transport": reply_transport,
+                    "Session": session.session_id,
+                    "X-Track": track,
+                },
+            )
+            return
+
+        self._log(f"RTSP SETUP rejected: 461 Unsupported Transport ({transport!r})")
+        await _respond(session, 461, "Unsupported Transport")
 
 
 def _default_sdp(session: RtspSession) -> str:
@@ -364,4 +487,3 @@ async def _respond(
     async with session._send_lock:
         session.writer.write(payload)
         await session.writer.drain()
-

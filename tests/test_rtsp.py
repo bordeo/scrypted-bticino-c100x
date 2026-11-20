@@ -132,10 +132,23 @@ async def test_rtsp_options_describe_setup_play_teardown_and_rtp() -> None:
 
 
 @pytest.mark.asyncio
-async def test_rtsp_udp_setup_returns_461() -> None:
-    """Scrypted tries UDP first and only falls back to TCP on a status error."""
+async def test_rtsp_udp_setup_accepted() -> None:
+    """Scrypted/HomeKit try UDP first; accept client_port SETUP and forward RTP."""
     server = RtspServer(idle_seconds=5)
     url = await server.start()
+    loop = asyncio.get_running_loop()
+
+    class Collector(asyncio.DatagramProtocol):
+        def __init__(self):
+            self.packets = []
+
+        def datagram_received(self, data, addr):
+            self.packets.append(data)
+
+    transport, protocol = await loop.create_datagram_endpoint(
+        Collector, local_addr=("127.0.0.1", 0)
+    )
+    client_port = transport.get_extra_info("sockname")[1]
     reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
     try:
         resp = await _rtsp_exchange(
@@ -144,23 +157,84 @@ async def test_rtsp_udp_setup_returns_461() -> None:
             [
                 f"SETUP {url}trackID=0 RTSP/1.0",
                 "CSeq: 1",
-                "Transport: RTP/AVP;unicast;client_port=40000-40001",
+                f"Transport: RTP/AVP;unicast;client_port={client_port}-{client_port + 1}",
             ],
         )
-        assert b"461 Unsupported Transport" in resp
-        assert b"200 OK" not in resp
+        assert b"200 OK" in resp
+        assert b"client_port=" in resp
+        assert b"server_port=" in resp
 
         resp = await _rtsp_exchange(
             reader,
             writer,
+            [f"PLAY {url} RTSP/1.0", "CSeq: 2", "Session: 1"],
+        )
+        assert b"200 OK" in resp
+
+        packet = serialize_rtp(
+            payload_type=96,
+            sequence=1,
+            timestamp=0,
+            ssrc=1,
+            payload=b"\x65\x00\x01",
+            marker=True,
+        )
+        await server.forward_rtp(packet, "video")
+        for _ in range(50):
+            if protocol.packets:
+                break
+            await asyncio.sleep(0.02)
+        assert protocol.packets
+        assert protocol.packets[0] == packet
+    finally:
+        transport.close()
+        writer.close()
+        with contextlib.suppress(Exception):
+            await writer.wait_closed()
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_rtsp_playing_idle_refreshed_by_rtp() -> None:
+    """RTP activity must keep the session alive past a short idle window."""
+    server = RtspServer(idle_seconds=0.4)
+    url = await server.start()
+    reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
+    try:
+        await _rtsp_exchange(
+            reader,
+            writer,
             [
                 f"SETUP {url}trackID=0 RTSP/1.0",
-                "CSeq: 2",
+                "CSeq: 1",
                 "Transport: RTP/AVP/TCP;unicast;interleaved=0-1",
             ],
         )
+        await _rtsp_exchange(
+            reader, writer, [f"PLAY {url} RTSP/1.0", "CSeq: 2", "Session: 1"]
+        )
+        packet = serialize_rtp(
+            payload_type=96, sequence=1, timestamp=0, ssrc=1, payload=b"\x65"
+        )
+        for _ in range(8):
+            await server.forward_rtp(packet, "video")
+            await asyncio.sleep(0.15)
+            # Drain interleaved frames so the reader buffer doesn't fill.
+            with contextlib.suppress(TimeoutError, asyncio.TimeoutError):
+                while True:
+                    dollar = await asyncio.wait_for(reader.readexactly(1), timeout=0.05)
+                    if dollar != b"$":
+                        break
+                    ch_len = await reader.readexactly(3)
+                    length = int.from_bytes(ch_len[1:3], "big")
+                    await reader.readexactly(length)
+        # Session still accepts GET_PARAMETER after > idle_seconds of wall time.
+        resp = await _rtsp_exchange(
+            reader,
+            writer,
+            [f"GET_PARAMETER {url} RTSP/1.0", "CSeq: 3", "Session: 1"],
+        )
         assert b"200 OK" in resp
-        assert b"interleaved=0-1" in resp
     finally:
         writer.close()
         with contextlib.suppress(Exception):

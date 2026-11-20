@@ -25,8 +25,10 @@ from .audio_codec import (
     SpeexFfmpegEncoder,
     TalkbackFormat,
     resolve_ffmpeg,
+    speex_silence_frame,
     talkback_format_for,
 )
+from .const import RTP_COUNTER_LOG_INTERVAL, RTP_COUNTER_LOG_WINDOW
 from .g711 import encode_g711, silence_frame
 from .sdp import (
     Codec,
@@ -210,6 +212,10 @@ class _MediaRtpProtocol(asyncio.DatagramProtocol):
         self._ssrc = secrets.randbelow(2**32)
         self._first_packet = True
         self._got_media = False
+        self.rx_packets = 0
+        self.rx_bytes = 0
+        self.tx_packets = 0
+        self.tx_bytes = 0
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
         self.transport = transport  # type: ignore[assignment]
@@ -304,6 +310,8 @@ class _MediaRtpProtocol(asyncio.DatagramProtocol):
             plain = self._inbound.unprotect(data)
         except pylibsrtp.Error:
             return
+        self.rx_packets += 1
+        self.rx_bytes += len(plain)
         if not self._got_media:
             self._got_media = True
             if self.on_first_media:
@@ -330,13 +338,15 @@ class _MediaRtpProtocol(asyncio.DatagramProtocol):
                 self._send_payload(payload, samples=160)
             elif name == "opus" and self._opus is not None:
                 self._send_payload(self._opus.encode_silence(), samples=self._opus.frame_samples)
-            elif name == "speex" and self._speex is not None:
-                # Cached after warm-up so keepalive stays near ptime.
-                payload = await self._speex.encode_silence()
+            elif name == "speex":
+                # Prefer canned 8 kHz Speex silence (door opens downlink once it
+                # hears upstream). Fall back to ffmpeg encoder when available.
+                samples = self._fmt.frame_samples if self._fmt else 160
+                payload = speex_silence_frame(self._codec.clock_rate or 8000)
+                if payload is None and self._speex is not None:
+                    payload = await self._speex.encode_silence()
                 if payload and not self._talkback:
-                    self._send_payload(
-                        payload, samples=self._fmt.frame_samples if self._fmt else 160
-                    )
+                    self._send_payload(payload, samples=samples)
         except (ValueError, pylibsrtp.Error, OSError):
             return
 
@@ -415,6 +425,8 @@ class _MediaRtpProtocol(asyncio.DatagramProtocol):
         )
         protected = self._outbound.protect(packet)
         self.transport.sendto(protected, self._remote)
+        self.tx_packets += 1
+        self.tx_bytes += len(protected)
         self._first_packet = False
         self._sequence = (self._sequence + 1) & 0xFFFF
         self._timestamp = (self._timestamp + samples) & 0xFFFFFFFF
@@ -450,11 +462,13 @@ class SrtpMediaSession:
         on_plain_rtp: RtpCallback | None = None,
         on_keyframe: Callable[[bytes], None] | None = None,
         ffmpeg_path: str | None = None,
+        on_log: Callable[[str], None] | None = None,
     ) -> None:
         self.sip = sip
         self.on_plain_rtp = on_plain_rtp
         self.on_keyframe = on_keyframe
         self.ffmpeg_path = ffmpeg_path
+        self.on_log = on_log
         self.negotiated: NegotiatedSession | None = None
         self.audio: _MediaRtpProtocol | None = None
         self.video: _MediaRtpProtocol | None = None
@@ -656,6 +670,18 @@ class SrtpMediaSession:
             self._last_packet = time.monotonic()
             self._primer = asyncio.create_task(self._prime_relay())
             self._keepalive = asyncio.create_task(self._audio_keepalive())
+            self._idle = asyncio.create_task(self._rtp_counter_log())
+            if session.audio:
+                codec = select_audio_codec(session.audio)
+                msg = (
+                    "Uplink silence keepalive started "
+                    f"({codec.name}/{codec.clock_rate if codec else '?'}) — "
+                    "door needs TX audio before it opens downlink"
+                )
+                _LOGGER.info("%s", msg)
+                if self.on_log:
+                    with contextlib.suppress(Exception):
+                        self.on_log(msg)
             return session
         except Exception:
             # Failed-start cleanup must not set ``_discarded`` — 486 retries
@@ -760,6 +786,32 @@ class SrtpMediaSession:
                 ):
                     await self.audio.send_silence()
                 await asyncio.sleep(0.02)
+        except asyncio.CancelledError:
+            raise
+
+    async def _rtp_counter_log(self) -> None:
+        """Log audio rx/tx packet/byte counts every 5 s for the first 30 s."""
+        try:
+            started = time.monotonic()
+            while not self._ending:
+                await asyncio.sleep(RTP_COUNTER_LOG_INTERVAL)
+                if self._ending:
+                    return
+                elapsed = time.monotonic() - started
+                audio = self.audio
+                if audio is None:
+                    continue
+                msg = (
+                    f"RTP audio counters t={elapsed:.0f}s "
+                    f"rx_pkts={audio.rx_packets} rx_bytes={audio.rx_bytes} "
+                    f"tx_pkts={audio.tx_packets} tx_bytes={audio.tx_bytes}"
+                )
+                _LOGGER.info("%s", msg)
+                if self.on_log:
+                    with contextlib.suppress(Exception):
+                        self.on_log(msg)
+                if elapsed >= RTP_COUNTER_LOG_WINDOW:
+                    return
         except asyncio.CancelledError:
             raise
 

@@ -33,6 +33,7 @@ def _plugin_for_topology(modules: list[dict], *, gateway_id: str, home_id: str =
     plugin.gateway_id = gateway_id
     plugin.home_id = home_id
     plugin.camera_ids = []
+    plugin.storage = SimpleNamespace(getItem=lambda *_a, **_k: None, setItem=lambda *_a, **_k: None)
     plugin._api = SimpleNamespace(modules=AsyncMock(return_value=modules))
     return plugin_main, plugin
 

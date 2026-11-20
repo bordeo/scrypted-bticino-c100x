@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.12 — unreleased
+
+- Field 0.1.11 (Speex accepted): door opens downlink only after upstream audio. Send continuous 20 ms Speex/8000 silence (canned libspeex frame, SRTP) from call start; log RTP audio rx/tx counters every 5 s for the first 30 s.
+- RTSP: accept UDP `client_port` SETUP (not only TCP interleaved); support `GET_PARAMETER` keepalives; idle timeout raised to 300 s and refreshed by RTP activity (fixes ~35 s `TimeoutError` teardown).
+- Loud `startIntercom` / talkback logs (entry, ffmpeg cmd, first uplink frame, errors). Monitoring start logs whether Intercom is advertised (talkback setting).
+- Casa tile: `takePicture` / `getPictureOptions` return a bundled 1280×720 “Citofono” JPEG placeholder when no recent keyframe is available (no SIP for snapshots).
+
 ## 0.1.11 — unreleased
 
 - Monitoring INVITE audio offer matches the official Door Entry / linphone-sdk shape: `RTP/SAVP 96 97 98 8 0 101 100` with Opus (`96 opus/48000/2`, `useinbandfec=1`), Speex 16/8 kHz, PCMA/PCMU, telephone-event, `a=ptime:20`, `a=sendrecv`, plus session `a=DEVADDR:` and SDES `a=crypto` (video remains H.264 `recvonly`).
