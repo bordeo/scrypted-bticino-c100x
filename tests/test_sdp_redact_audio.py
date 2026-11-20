@@ -267,7 +267,7 @@ async def test_ack_failure_after_200_still_byes_dialog(monkeypatch) -> None:
 
         async def start_monitoring(self, offer_sdp: str) -> bytes:
             self._dialog = dialog
-            raise SipError("ACK send failed")
+            raise SipError("ACK send failed", dialog=dialog)
 
         async def end_monitoring(self, dlg=None) -> None:
             self.bye_calls.append(dlg if dlg is not None else self._dialog)
@@ -318,7 +318,7 @@ async def test_ack_failure_after_end_still_byes_dialog(monkeypatch) -> None:
             await media.end()
             assert sip.on_call_end is None
             self._dialog = dialog
-            raise SipError("ACK send failed")
+            raise SipError("ACK send failed", dialog=dialog)
 
         async def end_monitoring(self, dlg=None) -> None:
             self.bye_calls.append(dlg if dlg is not None else self._dialog)
@@ -340,6 +340,58 @@ async def test_ack_failure_after_end_still_byes_dialog(monkeypatch) -> None:
         await media.start("eu-1")
     assert dialog in sip.bye_calls
     assert sip._dialog is None
+
+
+@pytest.mark.asyncio
+async def test_failed_start_does_not_bye_replacement_on_486(monkeypatch) -> None:
+    """486 after end()+replacement must not BYE the live replacement dialog."""
+    import c100x.srtp_media as srtp_media
+    from c100x.sip import SipError
+
+    real_reserve = srtp_media.reserve_even_pair
+    replacement = SipDialog(
+        call_id="live",
+        local_uri="sip:a@x",
+        remote_uri="sip:c100x@x",
+        local_tag="t2",
+        remote_to="sip:c100x@x;tag=r2",
+        remote_target="sip:c100x@x",
+        route_set=(),
+        local_sequence=1,
+    )
+
+    class FakeSip:
+        on_call_end = None
+        _dialog = None
+        bye_calls: list = []
+
+        async def start_monitoring(self, offer_sdp: str) -> bytes:
+            await media.end()
+            # Replacement session already owns the SIP dialog; this INVITE fails
+            # without installing a dialog of its own.
+            self._dialog = replacement
+            raise SipError("Monitoring call failed with SIP status 486")
+
+        async def end_monitoring(self, dlg=None) -> None:
+            self.bye_calls.append(dlg if dlg is not None else self._dialog)
+            if dlg is None or self._dialog is dlg:
+                self._dialog = None
+
+    sip = FakeSip()
+    media = SrtpMediaSession(sip)  # type: ignore[arg-type]
+    monkeypatch.setattr(
+        srtp_media, "reserve_even_pair", lambda bind_host="0.0.0.0": real_reserve("127.0.0.1")
+    )
+    monkeypatch.setattr(
+        srtp_media,
+        "discover_mappings",
+        lambda sockets: tuple(("203.0.113.10", 50000 + i) for i in range(len(sockets))),
+    )
+
+    with pytest.raises(SipError, match="486"):
+        await media.start("eu-1")
+    assert replacement not in sip.bye_calls
+    assert sip._dialog is replacement
 
 
 @pytest.mark.asyncio

@@ -38,7 +38,7 @@ from .sdp import (
     redact_sdp,
     select_audio_codec,
 )
-from .sip import SipClient
+from .sip import SipClient, SipError
 from .stun import StunError, binding_request, discover_mappings, is_stun, reply_binding
 
 _LOGGER = logging.getLogger(__name__)
@@ -612,11 +612,10 @@ class SrtpMediaSession:
             self._ensure_not_discarded()
             try:
                 answer = await self.sip.start_monitoring(offer.sdp)
-            except Exception:
-                # Dialog may already be installed if ACK failed after the 200.
-                # Capture even when end() already released on_call_end — BYE of
-                # that explicit dialog will not clear a replacement session.
-                owned_dialog = self.sip._dialog
+            except SipError as err:
+                # Only BYE a dialog this attempt installed (ACK-after-200).
+                # Never snapshot sip._dialog — a replacement may already own it.
+                owned_dialog = err.dialog
                 raise
             owned_dialog = self.sip._dialog
             # ``_ending`` clears when teardown finishes, so also require live

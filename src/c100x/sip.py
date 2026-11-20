@@ -33,7 +33,15 @@ _LOGGER = logging.getLogger(__name__)
 
 
 class SipError(Exception):
-    """SIP operation failed."""
+    """SIP operation failed.
+
+    ``dialog`` is set when this attempt already installed a monitoring dialog
+    that the caller must BYE (for example ACK failure after a 200).
+    """
+
+    def __init__(self, *args: object, dialog: SipDialog | None = None) -> None:
+        super().__init__(*args)
+        self.dialog = dialog
 
 
 class SipRegistrationTimeout(SipError):
@@ -244,6 +252,9 @@ class SipClient:
         self._send_lock = asyncio.Lock()
         self._last_transaction: dict[str, Any] | None = None
         self._dialog: SipDialog | None = None
+        # Bumped by end_monitoring so an in-flight INVITE cannot install a
+        # dialog after the start was cancelled / replaced.
+        self._monitoring_gen = 0
         # RFC 3261 §10.2.4: refreshes reuse Call-ID + From-tag; only CSeq grows.
         self._reg_call_id: str | None = None
         self._reg_from_tag: str | None = None
@@ -440,9 +451,14 @@ class SipClient:
             raise SipError(f"Door release failed with SIP status {response.status_code}")
 
     async def start_monitoring(self, offer_sdp: str) -> bytes:
-        """Start one user-initiated monitoring dialog and return its SDP answer."""
+        """Start one user-initiated monitoring dialog and return its SDP answer.
+
+        If a dialog is installed and ACK then fails, raises ``SipError`` with
+        ``dialog`` set so the caller can BYE that dialog only.
+        """
         if self._dialog is not None:
             raise SipError("A monitoring dialog is already active")
+        start_gen = self._monitoring_gen
         uri = f"sip:c100x@{self.account.domain}"
         response = await self._authenticated_request(
             "INVITE",
@@ -451,6 +467,8 @@ class SipClient:
             content_type="application/sdp",
             extra_headers=("Accept: application/sdp",),
         )
+        if start_gen != self._monitoring_gen:
+            raise SipError("Monitoring start was cancelled")
         transaction = self._last_transaction or {}
         if response.status_code != 200:
             raise SipError(f"Monitoring call failed with SIP status {response.status_code}")
@@ -474,8 +492,13 @@ class SipClient:
             )
         except KeyError as err:
             raise SipError("Monitoring transaction state was incomplete") from err
+        if start_gen != self._monitoring_gen or self._dialog is not None:
+            raise SipError("Monitoring start was cancelled")
         self._dialog = dialog
-        await self._send_ack(dialog)
+        try:
+            await self._send_ack(dialog)
+        except Exception as err:
+            raise SipError(f"Monitoring ACK failed: {err}", dialog=dialog) from err
         return response.body
 
     async def end_monitoring(self, dialog: SipDialog | None = None) -> None:
@@ -485,6 +508,7 @@ class SipClient:
         active ``_dialog``, clear it; otherwise leave a newer session's dialog
         alone (failed-start cleanup must not hang up a replacement call).
         """
+        self._monitoring_gen += 1
         if dialog is None:
             dialog, self._dialog = self._dialog, None
         elif self._dialog is dialog:
